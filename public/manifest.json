@@ -1,0 +1,14 @@
+{
+  "name": "Stok & Rekap Harian - SPD",
+  "short_name": "SPD Stok",
+  "description": "Pencatatan stok dan rekap penjualan harian Santoso Pizza Delivery",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1C1410",
+  "theme_color": "#1C1410",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
