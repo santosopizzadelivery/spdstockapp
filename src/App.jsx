@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
-  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory
+  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown
 } from 'lucide-react';
 import { auth } from './firebase';
 import { loadKey, saveKey } from './store';
@@ -296,6 +296,14 @@ function Field({ label, children }) {
     </div>
   );
 }
+function ReorderButtons({ index, total, onMoveUp, onMoveDown }) {
+  return (
+    <div className="flex flex-col gap-0.5 shrink-0">
+      <button onClick={onMoveUp} disabled={index === 0} className="p-0.5 rounded disabled:opacity-30" style={{ color: COLORS.textMuted }}><ChevronUp className="w-3.5 h-3.5" /></button>
+      <button onClick={onMoveDown} disabled={index === total - 1} className="p-0.5 rounded disabled:opacity-30" style={{ color: COLORS.textMuted }}><ChevronDown className="w-3.5 h-3.5" /></button>
+    </div>
+  );
+}
 
 /* ---------------- RINGKASAN ---------------- */
 function Ringkasan({ rawMaterials, baseStock, finishedStock, salesRecords }) {
@@ -446,6 +454,15 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
   };
   const remove = (id) => onSave(list.filter((i) => i.id !== id));
 
+  const canReorder = displayedList.length === list.length; // urutan cuma dijamin benar kalau tidak sedang difilter kategori
+  const moveItem = (index, direction) => {
+    const newIndex = index + direction;
+    if (newIndex < 0 || newIndex >= list.length) return;
+    const newList = [...list];
+    [newList[index], newList[newIndex]] = [newList[newIndex], newList[index]];
+    onSave(newList);
+  };
+
   // --- recipe row helpers (dipakai form Base: raw-only, & form Menu Jadi: raw+base) ---
   const addBaseRecipeRow = () => setForm({ ...form, recipe: [...form.recipe, { rowId: genId(), rawMaterialId: '', qty: '' }] });
   const updateBaseRecipeRow = (rowId, field, value) => setForm({ ...form, recipe: form.recipe.map((r) => (r.rowId === rowId ? { ...r, [field]: value } : r)) });
@@ -503,13 +520,16 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
           ))}
         </div>
       )}
+      {sub === 'pizza' && !canReorder && (
+        <p className="text-[10px] px-1" style={{ color: COLORS.textMuted }}>Pilih "Semua" di atas untuk bisa mengatur urutan.</p>
+      )}
 
       {displayedList.length === 0 && !form && (
         <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada {sub === 'bahan' ? 'bahan baku' : sub === 'base' ? 'base' : 'menu'} yang dicatat. Tambahkan item pertama.</p></Card>
       )}
 
       <div className="space-y-2">
-        {displayedList.map((item) => {
+        {displayedList.map((item, idx) => {
           if (sub === 'bahan') {
             const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
             return (
@@ -520,6 +540,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
                     <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Beli: {rupiah(item.purchasePrice)}/{item.unit}{item.minStock > 0 ? ` · Min. ${item.minStock} ${item.unit}` : ''}</p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
+                    {canReorder && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
@@ -548,6 +569,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
                     <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Biaya: {rupiah(unitCost)}/{item.unit} · Hasil {item.yieldQty || 1} {item.unit}/resep</p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
+                    <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
@@ -603,6 +625,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
                   </p>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
+                  {canReorder && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
                   <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                   <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                 </div>
