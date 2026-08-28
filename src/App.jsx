@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
-  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown
+  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck
 } from 'lucide-react';
 import { auth } from './firebase';
 import { loadKey, saveKey } from './store';
@@ -30,9 +30,10 @@ const fmtDate = (iso) => {
 const getMargin = (r) => (typeof r.margin === 'number' ? r.margin : r.total);
 
 const TABS = [
-  { id: 'ringkasan', label: 'Ringkasan', icon: Home },
+  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'stok', label: 'Stok', icon: Package },
   { id: 'penjualan', label: 'Penjualan', icon: Receipt },
+  { id: 'keuangan', label: 'Keuangan', icon: Wallet },
   { id: 'riwayat', label: 'Riwayat', icon: History },
 ];
 const CATEGORIES = ['Pizza', 'Minuman', 'Pelengkap', 'Lainnya'];
@@ -93,6 +94,45 @@ function isMenuLow(item, rawMaterials, baseStock) {
 }
 function menuHpp(item, rawMaterials, baseStock) {
   return item.recipeBased ? computeRecipeHpp(item.recipe, rawMaterials, baseStock) : item.purchasePrice || 0;
+}
+
+/* ---------------- HELPERS: Target Bulanan (Laba Kotor) & Gaji ---------------- */
+function computeTargetStats(employees, bufferAmount, salesRecords) {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const dayOfMonth = now.getDate();
+  const monthPrefix = `${year}-${String(month + 1).padStart(2, '0')}`;
+  const monthRecords = salesRecords.filter((r) => r.date.startsWith(monthPrefix));
+  const realisasi = monthRecords.reduce((s, r) => s + getMargin(r), 0);
+  const totalGaji = employees.reduce((s, e) => s + (e.salary || 0), 0);
+  const targetBulanan = totalGaji + (bufferAmount || 0);
+  const targetHarianRataRata = daysInMonth > 0 ? targetBulanan / daysInMonth : 0;
+  const expectedByToday = targetHarianRataRata * dayOfMonth;
+  const progressPercent = targetBulanan > 0 ? (realisasi / targetBulanan) * 100 : 0;
+  const sisaTarget = Math.max(0, targetBulanan - realisasi);
+  const sisaHari = Math.max(1, daysInMonth - dayOfMonth + 1);
+  const rataRataDibutuhkan = sisaTarget / sisaHari;
+  const paceDiff = realisasi - expectedByToday;
+  return { daysInMonth, dayOfMonth, realisasi, totalGaji, targetBulanan, targetHarianRataRata, expectedByToday, progressPercent, sisaTarget, sisaHari, rataRataDibutuhkan, paceDiff };
+}
+
+/* ---------------- HELPERS: minggu Minggu-Sabtu (komisi afiliator) ---------------- */
+function weekStartISO(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() - d.getDay()); // mundur ke hari Minggu
+  return d.toISOString().slice(0, 10);
+}
+function weekRangeLabel(startISO) {
+  const start = new Date(startISO + 'T00:00:00');
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  const fmt = (d) => d.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' });
+  return `${fmt(start)} – ${fmt(end)}`;
+}
+function computeAffiliateCommission(boxQty, combined) {
+  return (boxQty || 0) * (5000 + (combined ? 3000 : 0));
 }
 
 /* ---------------- ROOT: AUTH GATE ---------------- */
@@ -169,25 +209,40 @@ function LoginScreen() {
 function MainApp({ uid, email }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [activeTab, setActiveTab] = useState('ringkasan');
+  const [activeTab, setActiveTab] = useState('dashboard');
 
   const [rawMaterials, setRawMaterials] = useState([]);
   const [baseStock, setBaseStock] = useState([]);
   const [finishedStock, setFinishedStock] = useState([]);
   const [salesRecords, setSalesRecords] = useState([]);
+  const [employees, setEmployees] = useState([]);
+  const [targetSettings, setTargetSettings] = useState({ bufferAmount: 0 });
+  const [channels, setChannels] = useState([]);
+  const [affiliates, setAffiliates] = useState([]);
+  const [affiliateSales, setAffiliateSales] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const [rm, bs, fs, sr] = await Promise.all([
+      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales] = await Promise.all([
         loadKey(uid, 'raw-materials', []),
         loadKey(uid, 'base-stock', []),
         loadKey(uid, 'finished-stock', []),
         loadKey(uid, 'sales-records', []),
+        loadKey(uid, 'employees', []),
+        loadKey(uid, 'target-settings', { bufferAmount: 0 }),
+        loadKey(uid, 'channels', []),
+        loadKey(uid, 'affiliates', []),
+        loadKey(uid, 'affiliate-sales', []),
       ]);
       setRawMaterials(rm);
       setBaseStock(bs);
       setFinishedStock(fs);
       setSalesRecords(sr);
+      setEmployees(emp);
+      setTargetSettings(ts);
+      setChannels(ch);
+      setAffiliates(aff);
+      setAffiliateSales(affSales);
       setLoading(false);
     })();
   }, [uid]);
@@ -214,13 +269,18 @@ function MainApp({ uid, email }) {
   const saveBase = (v) => persist('base-stock', setBaseStock, v);
   const saveFinished = (v) => persist('finished-stock', setFinishedStock, v);
   const saveSales = (v) => persist('sales-records', setSalesRecords, v);
+  const saveEmployees = (v) => persist('employees', setEmployees, v);
+  const saveTargetSettings = (v) => persist('target-settings', setTargetSettings, v);
+  const saveChannels = (v) => persist('channels', setChannels, v);
+  const saveAffiliates = (v) => persist('affiliates', setAffiliates, v);
+  const saveAffiliateSales = (v) => persist('affiliate-sales', setAffiliateSales, v);
 
   return (
     <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <Header saving={saving} email={email} />
       <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 max-w-md w-full mx-auto">
-        {activeTab === 'ringkasan' && (
-          <Ringkasan rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} />
+        {activeTab === 'dashboard' && (
+          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} />
         )}
         {activeTab === 'stok' && (
           <StokTab
@@ -230,8 +290,15 @@ function MainApp({ uid, email }) {
         )}
         {activeTab === 'penjualan' && (
           <PenjualanTab
-            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords}
-            onSaveSales={saveSales} onSaveFinished={saveFinished} onSaveRaw={saveRaw} onSaveBase={saveBase}
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} channels={channels}
+            onSaveSales={saveSales} onSaveFinished={saveFinished} onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveChannels={saveChannels}
+          />
+        )}
+        {activeTab === 'keuangan' && (
+          <KeuanganTab
+            employees={employees} targetSettings={targetSettings} salesRecords={salesRecords}
+            onSaveEmployees={saveEmployees} onSaveTargetSettings={saveTargetSettings}
+            affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={saveAffiliates} onSaveAffiliateSales={saveAffiliateSales}
           />
         )}
         {activeTab === 'riwayat' && (
@@ -242,6 +309,11 @@ function MainApp({ uid, email }) {
               await persist('base-stock', setBaseStock, []);
               await persist('finished-stock', setFinishedStock, []);
               await persist('sales-records', setSalesRecords, []);
+              await persist('employees', setEmployees, []);
+              await persist('target-settings', setTargetSettings, { bufferAmount: 0 });
+              await persist('channels', setChannels, []);
+              await persist('affiliates', setAffiliates, []);
+              await persist('affiliate-sales', setAffiliateSales, []);
             }}
           />
         )}
@@ -305,13 +377,15 @@ function ReorderButtons({ index, total, onMoveUp, onMoveDown }) {
   );
 }
 
-/* ---------------- RINGKASAN ---------------- */
-function Ringkasan({ rawMaterials, baseStock, finishedStock, salesRecords }) {
+/* ---------------- DASHBOARD ---------------- */
+function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings }) {
   const today = todayISO();
-  const todayRecord = salesRecords.find((r) => r.date === today);
-  const todayTotal = todayRecord ? todayRecord.total : 0;
-  const todayMargin = todayRecord ? getMargin(todayRecord) : 0;
-  const todayItems = todayRecord ? todayRecord.items.reduce((s, i) => s + Number(i.qty || 0), 0) : 0;
+  const todayRecords = salesRecords.filter((r) => r.date === today);
+  const todayTotal = todayRecords.reduce((s, r) => s + r.total, 0);
+  const todayMargin = todayRecords.reduce((s, r) => s + getMargin(r), 0);
+  const todayItems = todayRecords.reduce((s, r) => s + r.items.reduce((s2, i) => s2 + Number(i.qty || 0), 0), 0);
+  const todayByChannel = {};
+  todayRecords.forEach((r) => { const c = r.channel || 'Tanpa channel'; todayByChannel[c] = (todayByChannel[c] || 0) + r.total; });
 
   const weekAgo = new Date();
   weekAgo.setDate(weekAgo.getDate() - 6);
@@ -319,6 +393,9 @@ function Ringkasan({ rawMaterials, baseStock, finishedStock, salesRecords }) {
   const weekRecords = salesRecords.filter((r) => r.date >= weekAgoISO && r.date <= today);
   const weekTotal = weekRecords.reduce((s, r) => s + r.total, 0);
   const weekMargin = weekRecords.reduce((s, r) => s + getMargin(r), 0);
+
+  const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
+  const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
 
   const lowRaw = rawMaterials.filter((m) => (m.minStock > 0 && m.currentStock <= m.minStock) || m.currentStock <= 0);
   const lowBase = baseStock.filter((m) => (m.minStock > 0 && m.currentStock <= m.minStock) || m.currentStock <= 0);
@@ -354,6 +431,44 @@ function Ringkasan({ rawMaterials, baseStock, finishedStock, salesRecords }) {
         <Card>
           <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><ChefHat className="w-3.5 h-3.5" /><span className="text-[11px]">Laba kotor 7 hari</span></div>
           <p className="font-display text-lg font-semibold" style={{ color: COLORS.secondary }}>{rupiah(weekMargin)}</p>
+        </Card>
+      </div>
+
+      {Object.keys(todayByChannel).length > 0 && (
+        <div>
+          <SectionLabel>Omzet Hari Ini per Channel</SectionLabel>
+          <Card>
+            <div className="space-y-1.5">
+              {Object.entries(todayByChannel).map(([ch, val]) => (
+                <div key={ch} className="flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><Store className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />{ch}</span>
+                  <span className="font-display font-semibold" style={{ color: COLORS.secondary }}>{rupiah(val)}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </div>
+      )}
+
+      <div>
+        <SectionLabel>Target Gaji Bulan Ini · {monthLabel}</SectionLabel>
+        <Card>
+          {t.targetBulanan <= 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada data karyawan/buffer — atur di tab Target.</p>
+          ) : (
+            <>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs" style={{ color: COLORS.textMuted }}>Realisasi: {rupiah(t.realisasi)} / {rupiah(t.targetBulanan)}</span>
+                <span className="text-sm font-display font-semibold" style={{ color: COLORS.secondary }}>{t.progressPercent.toFixed(0)}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: COLORS.surfaceLight }}>
+                <div className="h-full rounded-full" style={{ width: `${Math.min(100, t.progressPercent)}%`, background: COLORS.secondary }} />
+              </div>
+              <p className="text-[11px] mt-2" style={{ color: t.paceDiff >= 0 ? COLORS.secondary : COLORS.warning }}>
+                {t.paceDiff >= 0 ? `Di atas jalur +${rupiah(t.paceDiff)}` : `Di bawah jalur −${rupiah(Math.abs(t.paceDiff))}`} dari target harian rata-rata (hari ke-{t.dayOfMonth}/{t.daysInMonth})
+              </p>
+            </>
+          )}
         </Card>
       </div>
 
@@ -785,13 +900,22 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
 }
 
 /* ---------------- PENJUALAN TAB ---------------- */
-function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase }) {
+function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, channels, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase, onSaveChannels }) {
   const [date, setDate] = useState(todayISO());
+  const [channel, setChannel] = useState('');
+  const [showNewChannel, setShowNewChannel] = useState(false);
+  const [newChannelName, setNewChannelName] = useState('');
+  const [showManageChannels, setShowManageChannels] = useState(false);
   const [items, setItems] = useState([{ id: genId(), name: '', qty: '', price: '' }]);
   const [notes, setNotes] = useState('');
 
   useEffect(() => {
-    const existing = salesRecords.find((r) => r.date === date);
+    if (!channel && channels.length > 0) setChannel(channels[0].name);
+  }, [channels, channel]);
+
+  useEffect(() => {
+    if (!channel) return;
+    const existing = salesRecords.find((r) => r.date === date && r.channel === channel);
     if (existing) {
       setItems(existing.items.map((i) => ({ id: genId(), name: i.name, qty: String(i.qty), price: String(i.price) })));
       setNotes(existing.notes || '');
@@ -800,7 +924,17 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, on
       setNotes('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [date]);
+  }, [date, channel]);
+
+  const addChannel = () => {
+    if (!newChannelName.trim()) return;
+    const name = newChannelName.trim();
+    onSaveChannels([...channels, { id: genId(), name }]);
+    setChannel(name);
+    setNewChannelName('');
+    setShowNewChannel(false);
+  };
+  const removeChannel = (id) => onSaveChannels(channels.filter((c) => c.id !== id));
 
   const findMenu = (name) => finishedStock.find((f) => f.name.trim().toLowerCase() === name.trim().toLowerCase());
 
@@ -826,6 +960,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, on
   }, 0);
 
   const save = () => {
+    if (!channel) return;
     const cleanItems = items
       .filter((i) => i.name.trim() && parseFloat(i.qty) > 0)
       .map((i) => {
@@ -835,10 +970,10 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, on
       });
     if (cleanItems.length === 0) return;
 
-    const prevRecord = salesRecords.find((r) => r.date === date);
+    const prevRecord = salesRecords.find((r) => r.date === date && r.channel === channel);
     const totalRevenue = cleanItems.reduce((s, i) => s + i.qty * i.price, 0);
     const totalHpp = cleanItems.reduce((s, i) => s + i.qty * i.hpp, 0);
-    const record = { id: prevRecord ? prevRecord.id : genId(), date, items: cleanItems, total: totalRevenue, hpp: totalHpp, margin: totalRevenue - totalHpp, notes: notes.trim(), updatedAt: new Date().toISOString() };
+    const record = { id: prevRecord ? prevRecord.id : genId(), date, channel, items: cleanItems, total: totalRevenue, hpp: totalHpp, margin: totalRevenue - totalHpp, notes: notes.trim(), updatedAt: new Date().toISOString() };
     const nextRecords = prevRecord ? salesRecords.map((r) => (r.id === prevRecord.id ? record : r)) : [...salesRecords, record];
     onSaveSales(nextRecords);
 
@@ -878,14 +1013,47 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, on
     }
   };
 
-  const existingForDate = salesRecords.find((r) => r.date === date);
+  const existingForDate = salesRecords.find((r) => r.date === date && r.channel === channel);
 
   return (
     <div className="space-y-4">
       <Card>
+        <SectionLabel>Channel Penjualan</SectionLabel>
+        {channels.length === 0 && !showNewChannel && (
+          <p className="text-xs mb-2" style={{ color: COLORS.warning }}>Belum ada channel — tambahkan dulu di bawah.</p>
+        )}
+        {channels.length > 0 && !showNewChannel && (
+          <select value={channel} onChange={(e) => (e.target.value === '__new__' ? setShowNewChannel(true) : setChannel(e.target.value))} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text }}>
+            {channels.map((c) => <option key={c.id} value={c.name} style={{ background: COLORS.surface }}>{c.name}</option>)}
+            <option value="__new__" style={{ background: COLORS.surface }}>+ Tambah channel baru...</option>
+          </select>
+        )}
+        {showNewChannel && (
+          <div className="flex items-center gap-2">
+            <input value={newChannelName} onChange={(e) => setNewChannelName(e.target.value)} placeholder="Nama channel (mis. Outlet HO)" className="flex-1 rounded-lg px-3 py-2 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+            <button onClick={addChannel} className="px-3 py-2 rounded-lg text-sm font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Tambah</button>
+            {channels.length > 0 && <button onClick={() => setShowNewChannel(false)} style={{ color: COLORS.textMuted }}><X className="w-4 h-4" /></button>}
+          </div>
+        )}
+        {channels.length > 0 && (
+          <button onClick={() => setShowManageChannels(!showManageChannels)} className="text-[11px] mt-2" style={{ color: COLORS.textMuted }}>{showManageChannels ? 'Tutup' : 'Kelola channel'}</button>
+        )}
+        {showManageChannels && (
+          <div className="mt-2 space-y-1.5 pt-2 border-t" style={{ borderColor: COLORS.border }}>
+            {channels.map((c) => (
+              <div key={c.id} className="flex items-center justify-between text-xs">
+                <span style={{ color: COLORS.text }}>{c.name}</span>
+                <button onClick={() => removeChannel(c.id)} style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card>
         <SectionLabel>Tanggal</SectionLabel>
         <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text, colorScheme: 'dark' }} />
-        {existingForDate && <p className="text-[11px] mt-1.5" style={{ color: COLORS.warning }}>Tanggal ini sudah ada catatan — akan ditimpa (edit) saat disimpan.</p>}
+        {existingForDate && <p className="text-[11px] mt-1.5" style={{ color: COLORS.warning }}>Tanggal + channel ini sudah ada catatan — akan ditimpa (edit) saat disimpan.</p>}
       </Card>
 
       <div>
@@ -924,7 +1092,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, on
         <div className="flex items-center justify-between text-xs" style={{ color: 'rgba(242,233,220,0.85)' }}><span>Estimasi HPP: {rupiah(estHpp)}</span><span>Estimasi Laba: {rupiah(total - estHpp)}</span></div>
       </div>
 
-      <button onClick={save} className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5" style={{ background: COLORS.secondary, color: COLORS.bg }}><Save className="w-4 h-4" /> Simpan Rekap Hari Ini</button>
+      <button onClick={save} disabled={!channel} className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}><Save className="w-4 h-4" /> Simpan Rekap Hari Ini</button>
     </div>
   );
 }
@@ -933,7 +1101,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, on
 function RiwayatTab({ salesRecords, onSaveSales, onResetAll }) {
   const [expanded, setExpanded] = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
-  const sorted = [...salesRecords].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const sorted = [...salesRecords].sort((a, b) => (a.date === b.date ? (a.channel || '').localeCompare(b.channel || '') : a.date < b.date ? 1 : -1));
 
   const remove = (id) => { onSaveSales(salesRecords.filter((r) => r.id !== id)); if (expanded === id) setExpanded(null); };
 
@@ -949,7 +1117,7 @@ function RiwayatTab({ salesRecords, onSaveSales, onResetAll }) {
             return (
               <div key={r.id} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
                 <button onClick={() => setExpanded(isOpen ? null : r.id)} className="w-full flex items-center justify-between px-3.5 py-3">
-                  <div className="text-left"><p className="text-sm font-medium" style={{ color: COLORS.text }}>{fmtDate(r.date)}</p><p className="text-[11px]" style={{ color: COLORS.textMuted }}>{r.items.length} jenis item</p></div>
+                  <div className="text-left"><p className="text-sm font-medium" style={{ color: COLORS.text }}>{fmtDate(r.date)}</p><p className="text-[11px]" style={{ color: COLORS.textMuted }}>{r.channel ? `${r.channel} · ` : ''}{r.items.length} jenis item</p></div>
                   <div className="text-right"><p className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(r.total)}</p><p className="text-[11px]" style={{ color: COLORS.secondary }}>Laba: {rupiah(margin)}</p></div>
                 </button>
                 {isOpen && (
@@ -982,6 +1150,325 @@ function RiwayatTab({ salesRecords, onSaveSales, onResetAll }) {
               <button onClick={() => { onResetAll(); setConfirmReset(false); }} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Ya, hapus semua</button>
             </div>
           </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- AFFILIATE TAB (Nama Afiliator + Rekap Komisi Mingguan) ---------------- */
+function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales }) {
+  const [affForm, setAffForm] = useState(null); // { editingId, name }
+  const [entry, setEntry] = useState({ affiliateId: '', date: todayISO(), boxQty: '', combined: false });
+  const [expandedWeek, setExpandedWeek] = useState(null);
+
+  const openNewAff = () => setAffForm({ editingId: null, name: '' });
+  const openEditAff = (a) => setAffForm({ editingId: a.id, name: a.name });
+  const submitAff = () => {
+    if (!affForm.name.trim()) return;
+    const payload = { id: affForm.editingId || genId(), name: affForm.name.trim() };
+    onSaveAffiliates(affForm.editingId ? affiliates.map((a) => (a.id === affForm.editingId ? payload : a)) : [...affiliates, payload]);
+    setAffForm(null);
+  };
+  const removeAff = (id) => onSaveAffiliates(affiliates.filter((a) => a.id !== id));
+
+  const previewCommission = computeAffiliateCommission(parseFloat(entry.boxQty) || 0, entry.combined);
+  const saveEntry = () => {
+    if (!entry.affiliateId || !(parseFloat(entry.boxQty) > 0)) return;
+    const boxQty = parseFloat(entry.boxQty) || 0;
+    const commission = computeAffiliateCommission(boxQty, entry.combined);
+    onSaveAffiliateSales([...affiliateSales, { id: genId(), affiliateId: entry.affiliateId, date: entry.date, boxQty, combined: entry.combined, commission }]);
+    setEntry({ affiliateId: entry.affiliateId, date: entry.date, boxQty: '', combined: false });
+  };
+  const removeEntry = (id) => onSaveAffiliateSales(affiliateSales.filter((e) => e.id !== id));
+
+  const currentWeekStart = weekStartISO(todayISO());
+  const weeks = {};
+  affiliateSales.forEach((e) => {
+    const ws = weekStartISO(e.date);
+    if (!weeks[ws]) weeks[ws] = [];
+    weeks[ws].push(e);
+  });
+  const weekKeys = Object.keys(weeks).sort((a, b) => (a < b ? 1 : -1));
+
+  const summarizeWeek = (entries) => {
+    const byAff = {};
+    entries.forEach((e) => {
+      const aff = affiliates.find((a) => a.id === e.affiliateId);
+      const name = aff ? aff.name : 'Afiliator dihapus';
+      if (!byAff[name]) byAff[name] = { boxQty: 0, commission: 0 };
+      byAff[name].boxQty += e.boxQty;
+      byAff[name].commission += e.commission;
+    });
+    return byAff;
+  };
+
+  const currentWeekEntries = weeks[currentWeekStart] || [];
+  const currentWeekSummary = summarizeWeek(currentWeekEntries);
+  const currentWeekTotal = Object.values(currentWeekSummary).reduce((s, v) => s + v.commission, 0);
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <SectionLabel>Minggu Ini · {weekRangeLabel(currentWeekStart)} (dibayar Minggu)</SectionLabel>
+        <Card>
+          {Object.keys(currentWeekSummary).length === 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada penjualan afiliator minggu ini.</p>
+          ) : (
+            <div className="space-y-2">
+              {Object.entries(currentWeekSummary).map(([name, v]) => (
+                <div key={name} className="flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><UserCheck className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />{name} <span style={{ color: COLORS.textMuted }}>({v.boxQty} box)</span></span>
+                  <span className="font-display font-semibold" style={{ color: COLORS.secondary }}>{rupiah(v.commission)}</span>
+                </div>
+              ))}
+              <div className="flex items-center justify-between text-sm pt-2 border-t" style={{ borderColor: COLORS.border }}>
+                <span className="font-medium" style={{ color: COLORS.text }}>Total Komisi</span>
+                <span className="font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(currentWeekTotal)}</span>
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Input Penjualan Afiliator</SectionLabel>
+        <Card>
+          <div className="space-y-2.5">
+            <Field label="Afiliator">
+              <select value={entry.affiliateId} onChange={(e) => setEntry({ ...entry, affiliateId: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>Pilih afiliator</option>
+                {affiliates.map((a) => <option key={a.id} value={a.id} style={{ background: COLORS.surface }}>{a.name}</option>)}
+              </select>
+            </Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Tanggal"><input type="date" value={entry.date} onChange={(e) => setEntry({ ...entry, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} /></Field>
+              <Field label="Jumlah Box"><input type="number" value={entry.boxQty} onChange={(e) => setEntry({ ...entry, boxQty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            </div>
+            <button type="button" onClick={() => setEntry({ ...entry, combined: !entry.combined })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: entry.combined ? 'rgba(122,154,87,0.12)' : COLORS.bg }}>
+              <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><Truck className="w-4 h-4" /> Dikirim sekaligus (+Rp3.000/box)</span>
+              <span className="w-9 h-5 rounded-full relative transition-colors" style={{ background: entry.combined ? COLORS.secondary : COLORS.border }}>
+                <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: entry.combined ? '18px' : '2px' }} />
+              </span>
+            </button>
+            <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+              <span style={{ color: COLORS.textMuted }}>Rp{entry.combined ? '8.000' : '5.000'}/box</span>
+              <span style={{ color: COLORS.secondary }}>Komisi: {rupiah(previewCommission)}</span>
+            </div>
+          </div>
+          <button onClick={saveEntry} disabled={!entry.affiliateId || !(parseFloat(entry.boxQty) > 0)} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+            <Save className="w-4 h-4" /> Catat Penjualan
+          </button>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Daftar Afiliator</SectionLabel>
+        {affiliates.length === 0 && !affForm && <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada afiliator tercatat.</p></Card>}
+        <div className="space-y-2">
+          {affiliates.map((a) => (
+            <div key={a.id} className="flex items-center justify-between rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <p className="text-sm font-medium" style={{ color: COLORS.text }}>{a.name}</p>
+              <div className="flex items-center gap-1 shrink-0">
+                <button onClick={() => openEditAff(a)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                <button onClick={() => removeAff(a.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+        {!affForm && (
+          <button onClick={openNewAff} className="w-full mt-2 py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}><Plus className="w-4 h-4" /> Tambah Afiliator</button>
+        )}
+        {affForm && (
+          <Card className="mt-2">
+            <SectionLabel>{affForm.editingId ? 'Edit Afiliator' : 'Afiliator Baru'}</SectionLabel>
+            <Field label="Nama"><input value={affForm.name} onChange={(e) => setAffForm({ ...affForm, name: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            <div className="flex gap-2 mt-3.5">
+              <button onClick={() => setAffForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={submitAff} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+            </div>
+          </Card>
+        )}
+      </div>
+
+      <div>
+        <SectionLabel>Riwayat Mingguan</SectionLabel>
+        {weekKeys.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada riwayat.</p></Card>
+        ) : (
+          <div className="space-y-2">
+            {weekKeys.map((ws) => {
+              const isOpen = expandedWeek === ws;
+              const summary = summarizeWeek(weeks[ws]);
+              const total = Object.values(summary).reduce((s, v) => s + v.commission, 0);
+              return (
+                <div key={ws} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                  <button onClick={() => setExpandedWeek(isOpen ? null : ws)} className="w-full flex items-center justify-between px-3.5 py-3">
+                    <span className="text-sm font-medium" style={{ color: COLORS.text }}>{weekRangeLabel(ws)}{ws === currentWeekStart ? ' (minggu ini)' : ''}</span>
+                    <span className="font-display text-sm font-semibold" style={{ color: COLORS.secondary }}>{rupiah(total)}</span>
+                  </button>
+                  {isOpen && (
+                    <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                      {Object.entries(summary).map(([name, v]) => (
+                        <div key={name} className="flex items-center justify-between text-sm mt-2">
+                          <span style={{ color: COLORS.text }}>{name} <span style={{ color: COLORS.textMuted }}>×{v.boxQty} box</span></span>
+                          <span style={{ color: COLORS.textMuted }}>{rupiah(v.commission)}</span>
+                        </div>
+                      ))}
+                      <div className="pt-2 space-y-1">
+                        {weeks[ws].map((e) => {
+                          const aff = affiliates.find((a) => a.id === e.affiliateId);
+                          return (
+                            <div key={e.id} className="flex items-center justify-between text-[11px]" style={{ color: COLORS.textMuted }}>
+                              <span>{fmtDate(e.date)} · {aff ? aff.name : '-'} · {e.boxQty} box{e.combined ? ' · gabung kirim' : ''}</span>
+                              <button onClick={() => removeEntry(e.id)}><Trash2 className="w-3 h-3" /></button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales }) {
+  const [sub, setSub] = useState('gaji');
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {[{ id: 'gaji', label: 'Target Gaji' }, { id: 'afiliator', label: 'Afiliator' }].map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {sub === 'gaji' ? (
+        <TargetTab employees={employees} targetSettings={targetSettings} salesRecords={salesRecords} onSaveEmployees={onSaveEmployees} onSaveTargetSettings={onSaveTargetSettings} />
+      ) : (
+        <AffiliateTab affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={onSaveAffiliates} onSaveAffiliateSales={onSaveAffiliateSales} />
+      )}
+    </div>
+  );
+}
+
+/* ---------------- TARGET TAB (Gaji Karyawan + Target Bulanan) ---------------- */
+function TargetTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings }) {
+  const [empForm, setEmpForm] = useState(null); // { editingId, name, salary }
+  const [bufferInput, setBufferInput] = useState(String(targetSettings.bufferAmount || ''));
+
+  const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
+  const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+  const openNewEmp = () => setEmpForm({ editingId: null, name: '', salary: '' });
+  const openEditEmp = (e) => setEmpForm({ editingId: e.id, name: e.name, salary: String(e.salary) });
+  const submitEmp = () => {
+    if (!empForm.name.trim()) return;
+    const payload = { id: empForm.editingId || genId(), name: empForm.name.trim(), salary: parseFloat(empForm.salary) || 0 };
+    onSaveEmployees(empForm.editingId ? employees.map((e) => (e.id === empForm.editingId ? payload : e)) : [...employees, payload]);
+    setEmpForm(null);
+  };
+  const removeEmp = (id) => onSaveEmployees(employees.filter((e) => e.id !== id));
+  const saveBuffer = () => onSaveTargetSettings({ ...targetSettings, bufferAmount: parseFloat(bufferInput) || 0 });
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <SectionLabel>Progress Bulan Ini · {monthLabel}</SectionLabel>
+        <Card>
+          {t.targetBulanan <= 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Tambahkan karyawan dan/atau buffer di bawah untuk mulai memantau target.</p>
+          ) : (
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs" style={{ color: COLORS.textMuted }}>Target Bulanan</span>
+                <span className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.targetBulanan)}</span>
+              </div>
+              <div className="w-full h-2.5 rounded-full overflow-hidden" style={{ background: COLORS.surfaceLight }}>
+                <div className="h-full rounded-full" style={{ width: `${Math.min(100, t.progressPercent)}%`, background: COLORS.secondary }} />
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span style={{ color: COLORS.textMuted }}>Realisasi: {rupiah(t.realisasi)}</span>
+                <span className="font-semibold" style={{ color: COLORS.secondary }}>{t.progressPercent.toFixed(1)}%</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Target harian rata-rata</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.targetHarianRataRata)}</p>
+                </div>
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Sisa target</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.sisaTarget)}</p>
+                </div>
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Butuh/hari (sisa {t.sisaHari} hari)</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.rataRataDibutuhkan)}</p>
+                </div>
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Status vs jalur harian</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: t.paceDiff >= 0 ? COLORS.secondary : COLORS.warning }}>{t.paceDiff >= 0 ? `+${rupiah(t.paceDiff)}` : `−${rupiah(Math.abs(t.paceDiff))}`}</p>
+                </div>
+              </div>
+              <p className="text-[10px] pt-1" style={{ color: COLORS.textMuted }}>Target dihitung ulang tiap bulan kalender (gajian tanggal 1), dari daftar karyawan + buffer yang aktif saat ini.</p>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Buffer Biaya Operasional Lain</SectionLabel>
+        <Card>
+          <p className="text-[11px] mb-2" style={{ color: COLORS.textMuted }}>Perkiraan listrik, gas, sewa, dll di luar gaji — ditambahkan ke Target Bulanan supaya "tercapai" berarti benar-benar cukup, bukan cuma pas-pasan buat gaji.</p>
+          <div className="flex items-center gap-2">
+            <input type="number" value={bufferInput} onChange={(e) => setBufferInput(e.target.value)} placeholder="0" className="flex-1 rounded-lg px-3 py-2 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+            <button onClick={saveBuffer} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Simpan</button>
+          </div>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Daftar Karyawan · Total Gaji: {rupiah(t.totalGaji)}</SectionLabel>
+        {employees.length === 0 && !empForm && (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada karyawan tercatat.</p></Card>
+        )}
+        <div className="space-y-2">
+          {employees.map((e) => (
+            <div key={e.id} className="flex items-center justify-between rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <div className="min-w-0">
+                <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{e.name}</p>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{rupiah(e.salary)}/bulan</p>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button onClick={() => openEditEmp(e)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                <button onClick={() => removeEmp(e.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {!empForm && (
+          <button onClick={openNewEmp} className="w-full mt-2 py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+            <Plus className="w-4 h-4" /> Tambah Karyawan
+          </button>
+        )}
+
+        {empForm && (
+          <Card className="mt-2">
+            <SectionLabel>{empForm.editingId ? 'Edit Karyawan' : 'Karyawan Baru'}</SectionLabel>
+            <div className="space-y-2.5">
+              <Field label="Nama"><input value={empForm.name} onChange={(e) => setEmpForm({ ...empForm, name: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+              <Field label="Gaji per Bulan"><input type="number" value={empForm.salary} onChange={(e) => setEmpForm({ ...empForm, salary: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            </div>
+            <div className="flex gap-2 mt-3.5">
+              <button onClick={() => setEmpForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={submitEmp} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+            </div>
+          </Card>
         )}
       </div>
     </div>
