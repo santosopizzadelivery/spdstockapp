@@ -1020,7 +1020,12 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
       <Card>
         <SectionLabel>Channel Penjualan</SectionLabel>
         {channels.length === 0 && !showNewChannel && (
-          <p className="text-xs mb-2" style={{ color: COLORS.warning }}>Belum ada channel — tambahkan dulu di bawah.</p>
+          <div className="space-y-2">
+            <p className="text-xs" style={{ color: COLORS.warning }}>Belum ada channel — tambahkan dulu.</p>
+            <button onClick={() => setShowNewChannel(true)} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+              <Plus className="w-4 h-4" /> Tambah Channel
+            </button>
+          </div>
         )}
         {channels.length > 0 && !showNewChannel && (
           <select value={channel} onChange={(e) => (e.target.value === '__new__' ? setShowNewChannel(true) : setChannel(e.target.value))} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text }}>
