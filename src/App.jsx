@@ -565,13 +565,15 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
   };
   const remove = (id) => onSave(list.filter((i) => i.id !== id));
 
-  const canReorder = displayedList.length === list.length; // urutan cuma dijamin benar kalau tidak sedang difilter kategori
-  const moveItem = (index, direction) => {
-    const newIndex = index + direction;
-    if (newIndex < 0 || newIndex >= list.length) return;
-    const newList = [...list];
-    [newList[index], newList[newIndex]] = [newList[newIndex], newList[index]];
-    onSave(newList);
+  const moveItem = (filteredIndex, direction) => {
+    const targetFilteredIndex = filteredIndex + direction;
+    if (targetFilteredIndex < 0 || targetFilteredIndex >= displayedList.length) return;
+    const movingItem = displayedList[filteredIndex];
+    const targetItem = displayedList[targetFilteredIndex];
+    const withoutMoving = list.filter((i) => i.id !== movingItem.id);
+    const targetPos = withoutMoving.findIndex((i) => i.id === targetItem.id);
+    const insertAt = direction < 0 ? targetPos : targetPos + 1;
+    onSave([...withoutMoving.slice(0, insertAt), movingItem, ...withoutMoving.slice(insertAt)]);
   };
 
   // --- recipe row helpers (dipakai form Base: raw-only, & form Menu Jadi: raw+base) ---
@@ -631,9 +633,6 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
           ))}
         </div>
       )}
-      {sub === 'pizza' && !canReorder && (
-        <p className="text-[10px] px-1" style={{ color: COLORS.textMuted }}>Pilih "Semua" di atas untuk bisa mengatur urutan.</p>
-      )}
 
       {displayedList.length === 0 && !form && (
         <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada {sub === 'bahan' ? 'bahan baku' : sub === 'base' ? 'base' : 'menu'} yang dicatat. Tambahkan item pertama.</p></Card>
@@ -651,7 +650,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
                     <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Beli: {rupiah(item.purchasePrice)}/{item.unit}{item.minStock > 0 ? ` · Min. ${item.minStock} ${item.unit}` : ''}</p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
-                    {canReorder && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                    {<ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
@@ -736,7 +735,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
                   </p>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
-                  {canReorder && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                  {<ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
                   <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                   <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                 </div>
