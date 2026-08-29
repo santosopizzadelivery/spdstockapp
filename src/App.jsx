@@ -181,9 +181,7 @@ function LoginScreen() {
     <div className="h-screen flex items-center justify-center px-6 font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <form onSubmit={submit} className="w-full max-w-xs space-y-4">
         <div className="flex flex-col items-center gap-2 mb-2">
-          <div className="w-12 h-12 rounded-xl flex items-center justify-center" style={{ background: COLORS.primary }}>
-            <Flame className="w-6 h-6" style={{ color: COLORS.text }} />
-          </div>
+          <img src="/logo.png" alt="SPD" className="w-16 h-16 rounded-2xl object-contain" />
           <h1 className="font-display text-lg font-semibold">Stok & Rekap Harian</h1>
           <p className="text-xs" style={{ color: COLORS.textMuted }}>Santoso Pizza Delivery</p>
         </div>
@@ -338,9 +336,7 @@ function Header({ saving, email }) {
   return (
     <header className="shrink-0 px-4 py-3.5 flex items-center justify-between max-w-md w-full mx-auto" style={{ borderBottom: `1px solid ${COLORS.border}`, background: `linear-gradient(180deg, ${COLORS.surfaceLight}, ${COLORS.bg})` }}>
       <div className="flex items-center gap-2.5 min-w-0">
-        <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: COLORS.primary }}>
-          <Flame className="w-4.5 h-4.5" style={{ color: COLORS.text }} />
-        </div>
+        <img src="/logo.png" alt="SPD" className="w-8 h-8 rounded-lg object-contain shrink-0" />
         <div className="min-w-0">
           <h1 className="font-display text-base font-semibold leading-tight truncate" style={{ color: COLORS.text }}>Stok & Rekap Harian</h1>
           <p className="text-[11px] leading-tight truncate" style={{ color: COLORS.textMuted }}>{email}</p>
