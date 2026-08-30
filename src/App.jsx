@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
-  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck
+  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown
 } from 'lucide-react';
 import { auth } from './firebase';
 import { loadKey, saveKey } from './store';
@@ -156,6 +156,22 @@ function computeAffiliateCommission(boxQty, combined) {
   return (boxQty || 0) * (5000 + (combined ? 3000 : 0));
 }
 
+/* ---------------- HELPERS: Kerugian, Retur, Opname, Export ---------------- */
+const WASTE_REASONS = { rusak: 'Rusak', kadaluarsa: 'Kadaluarsa', 'gagal-produksi': 'Gagal Produksi', lainnya: 'Lainnya', 'retur-rusak': 'Retur (Rusak)', 'retur-bagus': 'Retur (Masih Bagus)', opname: 'Penyesuaian Opname' };
+
+function downloadCSV(filename, rows) {
+  const csv = rows.map((r) => r.map((cell) => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 /* ---------------- ROOT: AUTH GATE ---------------- */
 export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
@@ -240,10 +256,11 @@ function MainApp({ uid, email }) {
   const [affiliates, setAffiliates] = useState([]);
   const [affiliateSales, setAffiliateSales] = useState([]);
   const [productionLog, setProductionLog] = useState([]);
+  const [wasteLog, setWasteLog] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog] = await Promise.all([
+      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog, waste] = await Promise.all([
         loadKey(uid, 'raw-materials', []),
         loadKey(uid, 'base-stock', []),
         loadKey(uid, 'finished-stock', []),
@@ -254,6 +271,7 @@ function MainApp({ uid, email }) {
         loadKey(uid, 'affiliates', []),
         loadKey(uid, 'affiliate-sales', []),
         loadKey(uid, 'production-log', []),
+        loadKey(uid, 'waste-log', []),
       ]);
       setRawMaterials(rm);
       setBaseStock(bs);
@@ -265,6 +283,7 @@ function MainApp({ uid, email }) {
       setAffiliates(aff);
       setAffiliateSales(affSales);
       setProductionLog(prodLog);
+      setWasteLog(waste);
       setLoading(false);
     })();
   }, [uid]);
@@ -297,18 +316,19 @@ function MainApp({ uid, email }) {
   const saveAffiliates = (v) => persist('affiliates', setAffiliates, v);
   const saveAffiliateSales = (v) => persist('affiliate-sales', setAffiliateSales, v);
   const saveProductionLog = (v) => persist('production-log', setProductionLog, v);
+  const saveWasteLog = (v) => persist('waste-log', setWasteLog, v);
 
   return (
     <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <Header saving={saving} email={email} />
       <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 max-w-md w-full mx-auto">
         {activeTab === 'dashboard' && (
-          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} />
+          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} />
         )}
         {activeTab === 'stok' && (
           <StokTab
-            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} productionLog={productionLog}
-            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveProductionLog={saveProductionLog}
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} productionLog={productionLog} wasteLog={wasteLog}
+            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveProductionLog={saveProductionLog} onSaveWasteLog={saveWasteLog}
           />
         )}
         {activeTab === 'penjualan' && (
@@ -326,7 +346,7 @@ function MainApp({ uid, email }) {
         )}
         {activeTab === 'riwayat' && (
           <RiwayatTab
-            salesRecords={salesRecords} onSaveSales={saveSales}
+            salesRecords={salesRecords} onSaveSales={saveSales} wasteLog={wasteLog} onSaveWasteLog={saveWasteLog}
             onResetAll={async () => {
               await persist('raw-materials', setRawMaterials, []);
               await persist('base-stock', setBaseStock, []);
@@ -338,6 +358,7 @@ function MainApp({ uid, email }) {
               await persist('affiliates', setAffiliates, []);
               await persist('affiliate-sales', setAffiliateSales, []);
               await persist('production-log', setProductionLog, []);
+              await persist('waste-log', setWasteLog, []);
             }}
           />
         )}
@@ -390,6 +411,58 @@ function Field({ label, children }) {
     </div>
   );
 }
+function WasteFormPanel({ item, sub, wasteForm, setWasteForm, onCancel, onSubmit, rawMaterials, baseStock }) {
+  const isPizza = sub === 'pizza';
+  const qty = parseFloat(wasteForm.qty) || 0;
+  const estCost = wasteForm.mode === 'kerugian'
+    ? qty * (sub === 'pizza' ? menuHpp(item, rawMaterials, baseStock) : sub === 'base' ? computeBaseUnitCost(item, rawMaterials) : (item.purchasePrice || 0))
+    : (wasteForm.kondisi === 'rusak' ? qty * menuHpp(item, rawMaterials, baseStock) : 0);
+
+  return (
+    <div className="mt-3 pt-3 border-t space-y-2.5" style={{ borderColor: COLORS.border }}>
+      {isPizza && (
+        <div className="flex rounded-lg p-1" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+          {[{ id: 'kerugian', label: 'Kerugian Langsung' }, { id: 'retur', label: 'Retur Pelanggan' }].map((t) => (
+            <button key={t.id} onClick={() => setWasteForm({ ...wasteForm, mode: t.id })} className="flex-1 py-1.5 rounded-md text-xs font-medium" style={wasteForm.mode === t.id ? { background: COLORS.warning, color: COLORS.bg } : { color: COLORS.textMuted }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <Field label={`Jumlah (${item.unit})`}>
+        <input type="number" value={wasteForm.qty} onChange={(e) => setWasteForm({ ...wasteForm, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+      </Field>
+
+      {wasteForm.mode === 'kerugian' ? (
+        <Field label="Alasan">
+          <select value={wasteForm.reason} onChange={(e) => setWasteForm({ ...wasteForm, reason: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+            {['rusak', 'kadaluarsa', 'gagal-produksi', 'lainnya'].map((r) => <option key={r} value={r} style={{ background: COLORS.surface }}>{WASTE_REASONS[r]}</option>)}
+          </select>
+        </Field>
+      ) : (
+        <button type="button" onClick={() => setWasteForm({ ...wasteForm, kondisi: wasteForm.kondisi === 'bagus' ? 'rusak' : 'bagus' })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: wasteForm.kondisi === 'bagus' ? 'rgba(122,154,87,0.12)' : 'rgba(193,57,31,0.1)' }}>
+          <span style={{ color: COLORS.text }}>Kondisi: {wasteForm.kondisi === 'bagus' ? 'Masih Bagus (masuk stok lagi)' : 'Rusak (jadi biaya kerugian)'}</span>
+          <span className="text-xs font-medium" style={{ color: wasteForm.kondisi === 'bagus' ? COLORS.secondary : COLORS.primaryLight }}>Ganti</span>
+        </button>
+      )}
+
+      <Field label="Catatan (opsional)">
+        <input value={wasteForm.notes} onChange={(e) => setWasteForm({ ...wasteForm, notes: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+      </Field>
+
+      <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+        <span style={{ color: COLORS.textMuted }}>{wasteForm.mode === 'retur' && wasteForm.kondisi === 'bagus' ? 'Stok akan ditambah, tanpa biaya' : 'Estimasi dampak biaya'}</span>
+        <span className="font-semibold" style={{ color: estCost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{rupiah(estCost)}</span>
+      </div>
+
+      <div className="flex gap-2">
+        <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+        <button onClick={onSubmit} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.warning, color: COLORS.bg }}><Check className="w-4 h-4" /> Simpan</button>
+      </div>
+    </div>
+  );
+}
 function ReorderButtons({ index, total, onMoveUp, onMoveDown }) {
   return (
     <div className="flex flex-col gap-0.5 shrink-0">
@@ -400,7 +473,33 @@ function ReorderButtons({ index, total, onMoveUp, onMoveDown }) {
 }
 
 /* ---------------- DASHBOARD ---------------- */
-function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings }) {
+function GrowthBadge({ pct, label }) {
+  if (pct === null) return <p className="text-[10px] mt-0.5" style={{ color: COLORS.textMuted }}>Belum ada data pembanding</p>;
+  const up = pct >= 0;
+  return (
+    <p className="text-[11px] mt-0.5 flex items-center gap-1" style={{ color: up ? COLORS.secondary : COLORS.warning }}>
+      {up ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />}
+      {Math.abs(pct).toFixed(1)}% {label}
+    </p>
+  );
+}
+
+function TrendChart({ data }) {
+  const w = 300, h = 90, pad = 4;
+  const maxVal = Math.max(1, ...data.map((d) => Math.max(d.omzet, d.laba)));
+  const stepX = (w - pad * 2) / Math.max(1, data.length - 1);
+  const toY = (v) => h - pad - (v / maxVal) * (h - pad * 2);
+  const pathFor = (key) => data.map((d, i) => `${i === 0 ? 'M' : 'L'} ${pad + i * stepX} ${toY(d[key])}`).join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 90 }} preserveAspectRatio="none">
+      <path d={pathFor('omzet')} fill="none" stroke={COLORS.primary} strokeWidth="2" />
+      <path d={pathFor('laba')} fill="none" stroke={COLORS.secondary} strokeWidth="2" />
+    </svg>
+  );
+}
+
+function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings, wasteLog }) {
   const today = todayISO();
   const todayRecords = salesRecords.filter((r) => r.date === today);
   const todayTotal = todayRecords.reduce((s, r) => s + r.total, 0);
@@ -415,6 +514,34 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
   const weekRecords = salesRecords.filter((r) => r.date >= weekAgoISO && r.date <= today);
   const weekTotal = weekRecords.reduce((s, r) => s + r.total, 0);
   const weekMargin = weekRecords.reduce((s, r) => s + getMargin(r), 0);
+
+  // Perbandingan pertumbuhan: minggu ini vs minggu lalu, bulan ini vs bulan lalu
+  const prevWeekEnd = new Date(weekAgo); prevWeekEnd.setDate(prevWeekEnd.getDate() - 1);
+  const prevWeekStart = new Date(prevWeekEnd); prevWeekStart.setDate(prevWeekStart.getDate() - 6);
+  const prevWeekStartISO = prevWeekStart.toISOString().slice(0, 10);
+  const prevWeekEndISO = prevWeekEnd.toISOString().slice(0, 10);
+  const prevWeekTotal = salesRecords.filter((r) => r.date >= prevWeekStartISO && r.date <= prevWeekEndISO).reduce((s, r) => s + r.total, 0);
+  const weekGrowthPct = prevWeekTotal > 0 ? ((weekTotal - prevWeekTotal) / prevWeekTotal) * 100 : null;
+
+  const now = new Date();
+  const thisMonthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastMonthPrefix = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}`;
+  const thisMonthTotal = salesRecords.filter((r) => r.date.startsWith(thisMonthPrefix)).reduce((s, r) => s + r.total, 0);
+  const thisMonthMargin = salesRecords.filter((r) => r.date.startsWith(thisMonthPrefix)).reduce((s, r) => s + getMargin(r), 0);
+  const lastMonthTotal = salesRecords.filter((r) => r.date.startsWith(lastMonthPrefix)).reduce((s, r) => s + r.total, 0);
+  const monthGrowthPct = lastMonthTotal > 0 ? ((thisMonthTotal - lastMonthTotal) / lastMonthTotal) * 100 : null;
+
+  // Tren 30 hari (omzet & laba per hari)
+  const trend = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const iso = d.toISOString().slice(0, 10);
+    const dayRecords = salesRecords.filter((r) => r.date === iso);
+    trend.push({ date: iso, omzet: dayRecords.reduce((s, r) => s + r.total, 0), laba: dayRecords.reduce((s, r) => s + getMargin(r), 0) });
+  }
+
+  const wasteThisMonth = wasteLog.filter((w) => w.date.startsWith(thisMonthPrefix)).reduce((s, w) => s + w.cost, 0);
 
   const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
   const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
@@ -449,12 +576,52 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
         <Card>
           <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><Calendar className="w-3.5 h-3.5" /><span className="text-[11px]">Omzet 7 hari</span></div>
           <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(weekTotal)}</p>
+          <GrowthBadge pct={weekGrowthPct} label="vs 7 hari lalu" />
         </Card>
         <Card>
           <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><ChefHat className="w-3.5 h-3.5" /><span className="text-[11px]">Laba kotor 7 hari</span></div>
           <p className="font-display text-lg font-semibold" style={{ color: COLORS.secondary }}>{rupiah(weekMargin)}</p>
         </Card>
       </div>
+
+      <div>
+        <SectionLabel>Akumulasi Bulan Ini · {monthLabel}</SectionLabel>
+        <div className="grid grid-cols-2 gap-3">
+          <Card>
+            <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><Wallet className="w-3.5 h-3.5" /><span className="text-[11px]">Omzet bulan ini</span></div>
+            <p className="font-display text-xl font-semibold" style={{ color: COLORS.text }}>{rupiah(thisMonthTotal)}</p>
+            <GrowthBadge pct={monthGrowthPct} label="vs bulan lalu" />
+          </Card>
+          <Card>
+            <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><ChefHat className="w-3.5 h-3.5" /><span className="text-[11px]">Laba kotor bulan ini</span></div>
+            <p className="font-display text-xl font-semibold" style={{ color: COLORS.secondary }}>{rupiah(thisMonthMargin)}</p>
+            <p className="text-[11px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
+          </Card>
+        </div>
+      </div>
+
+      <div>
+        <SectionLabel>Tren 30 Hari</SectionLabel>
+        <Card>
+          <TrendChart data={trend} />
+          <div className="flex items-center justify-center gap-4 mt-2">
+            <span className="flex items-center gap-1.5 text-[11px]" style={{ color: COLORS.textMuted }}><span className="w-2.5 h-2.5 rounded-full" style={{ background: COLORS.primary }} />Omzet</span>
+            <span className="flex items-center gap-1.5 text-[11px]" style={{ color: COLORS.textMuted }}><span className="w-2.5 h-2.5 rounded-full" style={{ background: COLORS.secondary }} />Laba Kotor</span>
+          </div>
+        </Card>
+      </div>
+
+      {wasteThisMonth > 0 && (
+        <div>
+          <SectionLabel>Kerugian & Retur Bulan Ini</SectionLabel>
+          <Card>
+            <div className="flex items-center justify-between">
+              <span className="text-sm" style={{ color: COLORS.textMuted }}>Total biaya dari kerugian/retur rusak</span>
+              <span className="font-display text-base font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(wasteThisMonth)}</span>
+            </div>
+          </Card>
+        </div>
+      )}
 
       {Object.keys(todayByChannel).length > 0 && (
         <div>
@@ -518,12 +685,15 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
 }
 
 /* ---------------- STOK TAB (3 tingkat: Bahan Baku / Base / Menu Jadi) ---------------- */
-function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, productionLog, onSaveRaw, onSaveBase, onSaveFinished, onSaveProductionLog }) {
+function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, productionLog, wasteLog, onSaveRaw, onSaveBase, onSaveFinished, onSaveProductionLog, onSaveWasteLog }) {
   const [sub, setSub] = useState('bahan');
   const [form, setForm] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState('Semua');
   const [sortMode, setSortMode] = useState('manual');
   const [producing, setProducing] = useState(null); // { itemId, batches }
+  const [wasteForm, setWasteForm] = useState(null); // { itemId, mode: 'kerugian'|'retur', qty, reason, kondisi, notes }
+  const [opnameMode, setOpnameMode] = useState(false);
+  const [opnameInputs, setOpnameInputs] = useState({}); // { itemId: physicalQty }
 
   const subMeta = {
     bahan: { list: rawMaterials, onSave: onSaveRaw },
@@ -659,6 +829,79 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
     setProducing(null);
   };
 
+  // --- kerugian & retur ---
+  const logWaste = (entry) => onSaveWasteLog([...wasteLog, { id: genId(), date: todayISO(), ...entry }]);
+
+  const applyRecipeDelta = (recipe, deltaQty) => {
+    // deltaQty positif = KURANGI stok bahan (dipakai/hilang), negatif = TAMBAH stok bahan (retur bagus/dikembalikan)
+    const rawDelta = {};
+    const baseDelta = {};
+    (recipe || []).forEach((ing) => {
+      const type = ingSourceType(ing);
+      const id = ingSourceId(ing);
+      const amount = ing.qty * deltaQty;
+      if (type === 'base') baseDelta[id] = (baseDelta[id] || 0) + amount;
+      else rawDelta[id] = (rawDelta[id] || 0) + amount;
+    });
+    if (Object.keys(rawDelta).length > 0) onSaveRaw(rawMaterials.map((rm) => (rawDelta[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDelta[rm.id]) } : rm)));
+    if (Object.keys(baseDelta).length > 0) onSaveBase(baseStock.map((b) => (baseDelta[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDelta[b.id]) } : b)));
+  };
+
+  const submitWasteForm = () => {
+    const item = finishedStock.find((i) => i.id === wasteForm.itemId) || baseStock.find((i) => i.id === wasteForm.itemId) || rawMaterials.find((i) => i.id === wasteForm.itemId);
+    const qty = parseFloat(wasteForm.qty) || 0;
+    if (!item || qty <= 0) return;
+    const sourceType = sub;
+
+    if (wasteForm.mode === 'kerugian') {
+      let cost = 0;
+      if (sourceType === 'pizza') {
+        cost = qty * menuHpp(item, rawMaterials, baseStock);
+        if (item.recipeBased) applyRecipeDelta(item.recipe, qty);
+        else onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, currentStock: Math.max(0, f.currentStock - qty) } : f)));
+      } else if (sourceType === 'base') {
+        cost = qty * computeBaseUnitCost(item, rawMaterials);
+        onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: Math.max(0, b.currentStock - qty) } : b)));
+      } else {
+        cost = qty * (item.purchasePrice || 0);
+        onSaveRaw(rawMaterials.map((r) => (r.id === item.id ? { ...r, currentStock: Math.max(0, r.currentStock - qty) } : r)));
+      }
+      logWaste({ sourceType, sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost, reason: wasteForm.reason, notes: wasteForm.notes.trim() });
+    } else {
+      // retur (khusus Menu Jadi)
+      if (wasteForm.kondisi === 'bagus') {
+        if (item.recipeBased) applyRecipeDelta(item.recipe, -qty);
+        else onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, currentStock: f.currentStock + qty } : f)));
+        logWaste({ sourceType: 'pizza', sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost: 0, reason: 'retur-bagus', notes: wasteForm.notes.trim() });
+      } else {
+        const cost = qty * menuHpp(item, rawMaterials, baseStock);
+        logWaste({ sourceType: 'pizza', sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost, reason: 'retur-rusak', notes: wasteForm.notes.trim() });
+      }
+    }
+    setWasteForm(null);
+  };
+
+  // --- stock opname ---
+  const applyOpname = () => {
+    const entries = Object.entries(opnameInputs).filter(([, v]) => v !== '' && v !== undefined);
+    if (entries.length === 0) return;
+    let nextList = list;
+    entries.forEach(([itemId, physicalStr]) => {
+      const item = nextList.find((i) => i.id === itemId);
+      if (!item) return;
+      const physical = parseFloat(physicalStr) || 0;
+      const delta = item.currentStock - physical; // positif = kekurangan (hilang)
+      nextList = nextList.map((i) => (i.id === itemId ? { ...i, currentStock: physical } : i));
+      if (delta !== 0) {
+        const unitCost = sub === 'base' ? computeBaseUnitCost(item, rawMaterials) : (item.purchasePrice || 0);
+        logWaste({ sourceType: sub, sourceId: item.id, sourceName: item.name, qty: Math.abs(delta), unit: item.unit, cost: delta > 0 ? delta * unitCost : 0, reason: 'opname', notes: delta > 0 ? `Stok sistem lebih banyak dari fisik (kurang ${delta} ${item.unit})` : `Stok fisik lebih banyak dari sistem (lebih ${-delta} ${item.unit})` });
+      }
+    });
+    onSave(nextList);
+    setOpnameInputs({});
+    setOpnameMode(false);
+  };
+
   const SUB_TABS = [{ id: 'bahan', label: 'Bahan Baku' }, { id: 'base', label: 'Base' }, { id: 'pizza', label: 'Menu Jadi' }];
 
   return (
@@ -694,6 +937,15 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
         </div>
       )}
 
+      {(sub === 'bahan' || sub === 'base') && (
+        <button onClick={() => { setOpnameMode(!opnameMode); setOpnameInputs({}); }} className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-medium" style={{ background: opnameMode ? COLORS.warning : COLORS.surface, color: opnameMode ? COLORS.bg : COLORS.textMuted, border: `1px solid ${COLORS.border}` }}>
+          <ClipboardList className="w-3.5 h-3.5" /> {opnameMode ? 'Batal Stock Opname' : 'Mode Stock Opname'}
+        </button>
+      )}
+      {opnameMode && (sub === 'bahan' || sub === 'base') && (
+        <p className="text-[11px] px-1" style={{ color: COLORS.textMuted }}>Isi kolom "Fisik" untuk item yang stoknya beda dari hitungan sistem, lalu tekan Terapkan di bawah. Item yang tidak diisi tidak akan berubah.</p>
+      )}
+
       {displayedList.length === 0 && !form && (
         <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada {sub === 'bahan' ? 'bahan baku' : sub === 'base' ? 'base' : 'menu'} yang dicatat. Tambahkan item pertama.</p></Card>
       )}
@@ -702,6 +954,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
         {(sub === 'pizza' ? sortedList : displayedList).map((item, idx) => {
           if (sub === 'bahan') {
             const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
+            const isWasteThis = wasteForm && wasteForm.itemId === item.id;
             return (
               <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
                 <div className="flex items-start justify-between gap-2">
@@ -710,19 +963,28 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                     <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Beli: {rupiah(item.purchasePrice)}/{item.unit}{item.minStock > 0 ? ` · Min. ${item.minStock} ${item.unit}` : ''}</p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
-                    {<ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                    {!opnameMode && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, mode: 'kerugian', qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
                 </div>
-                <div className="flex items-center justify-between mt-2.5">
-                  <div className="flex items-center gap-2">
-                    <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
-                    <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
-                    <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                {opnameMode ? (
+                  <div className="flex items-center gap-2 mt-2.5">
+                    <span className="text-xs" style={{ color: COLORS.textMuted }}>Sistem: {item.currentStock} {item.unit} → Fisik:</span>
+                    <input type="number" value={opnameInputs[item.id] ?? ''} onChange={(e) => setOpnameInputs({ ...opnameInputs, [item.id]: e.target.value })} placeholder={String(item.currentStock)} className="w-24 rounded-lg px-2 py-1 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
                   </div>
-                  {low && <AlertTriangle className="w-4 h-4" style={{ color: COLORS.warning }} />}
-                </div>
+                ) : (
+                  <div className="flex items-center justify-between mt-2.5">
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
+                      <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
+                      <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                    </div>
+                    {low && <AlertTriangle className="w-4 h-4" style={{ color: COLORS.warning }} />}
+                  </div>
+                )}
+                {isWasteThis && <WasteFormPanel item={item} sub={sub} wasteForm={wasteForm} setWasteForm={setWasteForm} onCancel={() => setWasteForm(null)} onSubmit={submitWasteForm} rawMaterials={rawMaterials} baseStock={baseStock} />}
               </div>
             );
           }
@@ -731,6 +993,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
             const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
             const unitCost = computeBaseUnitCost(item, rawMaterials);
             const isProducingThis = producing && producing.itemId === item.id;
+            const isWasteThis = wasteForm && wasteForm.itemId === item.id;
             const prodStats = computeBaseProductionStats(item.id, productionLog);
             return (
               <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
@@ -741,19 +1004,28 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                     <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Produksi bulan ini: <span style={{ color: COLORS.text }}>{prodStats.thisMonth} {item.unit}</span> · Rata-rata/bulan: <span style={{ color: COLORS.text }}>{prodStats.avgPerMonth.toFixed(1)} {item.unit}</span></p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
-                    <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />
+                    {!opnameMode && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, mode: 'kerugian', qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
                 </div>
-                <div className="flex items-center justify-between mt-2.5">
-                  <div className="flex items-center gap-2">
-                    <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
-                    <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
-                    <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                {opnameMode ? (
+                  <div className="flex items-center gap-2 mt-2.5">
+                    <span className="text-xs" style={{ color: COLORS.textMuted }}>Sistem: {item.currentStock} {item.unit} → Fisik:</span>
+                    <input type="number" value={opnameInputs[item.id] ?? ''} onChange={(e) => setOpnameInputs({ ...opnameInputs, [item.id]: e.target.value })} placeholder={String(item.currentStock)} className="w-24 rounded-lg px-2 py-1 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
                   </div>
-                  <button onClick={() => startProduce(item)} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium" style={{ background: COLORS.secondary, color: COLORS.bg }}><Factory className="w-3.5 h-3.5" /> Produksi</button>
-                </div>
+                ) : (
+                  <div className="flex items-center justify-between mt-2.5">
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
+                      <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
+                      <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                    </div>
+                    <button onClick={() => startProduce(item)} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium" style={{ background: COLORS.secondary, color: COLORS.bg }}><Factory className="w-3.5 h-3.5" /> Produksi</button>
+                  </div>
+                )}
+                {isWasteThis && <WasteFormPanel item={item} sub={sub} wasteForm={wasteForm} setWasteForm={setWasteForm} onCancel={() => setWasteForm(null)} onSubmit={submitWasteForm} rawMaterials={rawMaterials} baseStock={baseStock} />}
                 {isProducingThis && (
                   <div className="mt-3 pt-3 border-t space-y-2" style={{ borderColor: COLORS.border }}>
                     <div className="flex items-center gap-2">
@@ -784,6 +1056,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
           const hpp = menuHpp(item, rawMaterials, baseStock);
           const margin = (item.sellingPrice || 0) - hpp;
           const monthlySold = computeMonthlySold(item.name, salesRecords);
+          const isWasteThis = wasteForm && wasteForm.itemId === item.id;
           return (
             <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
               <div className="flex items-start justify-between gap-2">
@@ -800,6 +1073,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                   {sortMode === 'manual' && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                  <button onClick={() => setWasteForm({ itemId: item.id, mode: 'kerugian', qty: '', reason: 'rusak', kondisi: 'bagus', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><Undo2 className="w-3.5 h-3.5" /></button>
                   <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                   <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                 </div>
@@ -819,12 +1093,19 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                   {low && <AlertTriangle className="w-4 h-4" style={{ color: COLORS.warning }} />}
                 </div>
               )}
+              {isWasteThis && <WasteFormPanel item={item} sub={sub} wasteForm={wasteForm} setWasteForm={setWasteForm} onCancel={() => setWasteForm(null)} onSubmit={submitWasteForm} rawMaterials={rawMaterials} baseStock={baseStock} />}
             </div>
           );
         })}
       </div>
 
-      {!form && (
+      {opnameMode && (
+        <button onClick={applyOpname} className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5" style={{ background: COLORS.warning, color: COLORS.bg }}>
+          <ClipboardList className="w-4 h-4" /> Terapkan Hasil Opname
+        </button>
+      )}
+
+      {!form && !opnameMode && (
         <button onClick={openNew} className="w-full py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
           <Plus className="w-4 h-4" /> Tambah {sub === 'bahan' ? 'Bahan Baku' : sub === 'base' ? 'Base' : 'Menu'}
         </button>
@@ -1162,47 +1443,115 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
 }
 
 /* ---------------- RIWAYAT TAB ---------------- */
-function RiwayatTab({ salesRecords, onSaveSales, onResetAll }) {
+function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, onResetAll }) {
+  const [sub, setSub] = useState('penjualan');
   const [expanded, setExpanded] = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const sorted = [...salesRecords].sort((a, b) => (a.date === b.date ? (a.channel || '').localeCompare(b.channel || '') : a.date < b.date ? 1 : -1));
+  const wasteSorted = [...wasteLog].sort((a, b) => (a.date < b.date ? 1 : -1));
 
   const remove = (id) => { onSaveSales(salesRecords.filter((r) => r.id !== id)); if (expanded === id) setExpanded(null); };
+  const removeWaste = (id) => onSaveWasteLog(wasteLog.filter((w) => w.id !== id));
+
+  const exportSales = () => {
+    const rows = [['Tanggal', 'Channel', 'Item', 'Qty', 'Harga Satuan', 'Subtotal', 'HPP Satuan', 'Catatan']];
+    sorted.forEach((r) => {
+      r.items.forEach((i) => rows.push([r.date, r.channel || '', i.name, i.qty, i.price, i.qty * i.price, i.hpp || 0, r.notes || '']));
+    });
+    downloadCSV(`rekap-penjualan-${todayISO()}.csv`, rows);
+  };
+  const exportWaste = () => {
+    const rows = [['Tanggal', 'Sumber', 'Nama Item', 'Qty', 'Satuan', 'Alasan', 'Estimasi Biaya', 'Catatan']];
+    wasteSorted.forEach((w) => rows.push([w.date, w.sourceType, w.sourceName, w.qty, w.unit, WASTE_REASONS[w.reason] || w.reason, w.cost, w.notes || '']));
+    downloadCSV(`kerugian-retur-${todayISO()}.csv`, rows);
+  };
+
+  const monthPrefix = todayISO().slice(0, 7);
+  const wasteThisMonth = wasteLog.filter((w) => w.date.startsWith(monthPrefix)).reduce((s, w) => s + w.cost, 0);
 
   return (
     <div className="space-y-4">
-      {sorted.length === 0 ? (
-        <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada riwayat penjualan.</p></Card>
-      ) : (
-        <div className="space-y-2">
-          {sorted.map((r) => {
-            const isOpen = expanded === r.id;
-            const margin = getMargin(r);
-            return (
-              <div key={r.id} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
-                <button onClick={() => setExpanded(isOpen ? null : r.id)} className="w-full flex items-center justify-between px-3.5 py-3">
-                  <div className="text-left"><p className="text-sm font-medium" style={{ color: COLORS.text }}>{fmtDate(r.date)}</p><p className="text-[11px]" style={{ color: COLORS.textMuted }}>{r.channel ? `${r.channel} · ` : ''}{r.items.length} jenis item</p></div>
-                  <div className="text-right"><p className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(r.total)}</p><p className="text-[11px]" style={{ color: COLORS.secondary }}>Laba: {rupiah(margin)}</p></div>
-                </button>
-                {isOpen && (
-                  <div className="px-3.5 pb-3.5 border-t" style={{ borderColor: COLORS.border }}>
-                    <div className="mt-2.5 space-y-1.5">
-                      {r.items.map((i, idx) => (
-                        <div key={idx} className="flex items-center justify-between text-sm">
-                          <span style={{ color: COLORS.text }}>{i.name} <span style={{ color: COLORS.textMuted }}>×{i.qty}</span></span>
-                          <span style={{ color: COLORS.textMuted }}>{rupiah(i.qty * i.price)}</span>
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {[{ id: 'penjualan', label: 'Penjualan' }, { id: 'kerugian', label: 'Kerugian & Retur' }].map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {sub === 'penjualan' ? (
+        <>
+          <button onClick={exportSales} disabled={sorted.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
+            <Download className="w-4 h-4" /> Export ke Excel/CSV
+          </button>
+          {sorted.length === 0 ? (
+            <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada riwayat penjualan.</p></Card>
+          ) : (
+            <div className="space-y-2">
+              {sorted.map((r) => {
+                const isOpen = expanded === r.id;
+                const margin = getMargin(r);
+                return (
+                  <div key={r.id} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                    <button onClick={() => setExpanded(isOpen ? null : r.id)} className="w-full flex items-center justify-between px-3.5 py-3">
+                      <div className="text-left"><p className="text-sm font-medium" style={{ color: COLORS.text }}>{fmtDate(r.date)}</p><p className="text-[11px]" style={{ color: COLORS.textMuted }}>{r.channel ? `${r.channel} · ` : ''}{r.items.length} jenis item</p></div>
+                      <div className="text-right"><p className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(r.total)}</p><p className="text-[11px]" style={{ color: COLORS.secondary }}>Laba: {rupiah(margin)}</p></div>
+                    </button>
+                    {isOpen && (
+                      <div className="px-3.5 pb-3.5 border-t" style={{ borderColor: COLORS.border }}>
+                        <div className="mt-2.5 space-y-1.5">
+                          {r.items.map((i, idx) => (
+                            <div key={idx} className="flex items-center justify-between text-sm">
+                              <span style={{ color: COLORS.text }}>{i.name} <span style={{ color: COLORS.textMuted }}>×{i.qty}</span></span>
+                              <span style={{ color: COLORS.textMuted }}>{rupiah(i.qty * i.price)}</span>
+                            </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-                    {r.notes && <p className="text-[11px] mt-2 italic" style={{ color: COLORS.textMuted }}>"{r.notes}"</p>}
-                    <button onClick={() => remove(r.id)} className="mt-3 flex items-center gap-1.5 text-xs" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /> Hapus catatan ini</button>
+                        {r.notes && <p className="text-[11px] mt-2 italic" style={{ color: COLORS.textMuted }}>"{r.notes}"</p>}
+                        <button onClick={() => remove(r.id)} className="mt-3 flex items-center gap-1.5 text-xs" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /> Hapus catatan ini</button>
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <Card>
+            <div className="flex items-center justify-between">
+              <span className="text-sm" style={{ color: COLORS.textMuted }}>Total kerugian bulan ini</span>
+              <span className="font-display text-lg font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(wasteThisMonth)}</span>
+            </div>
+          </Card>
+          <button onClick={exportWaste} disabled={wasteSorted.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
+            <Download className="w-4 h-4" /> Export ke Excel/CSV
+          </button>
+          {wasteSorted.length === 0 ? (
+            <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan kerugian atau retur.</p></Card>
+          ) : (
+            <div className="space-y-2">
+              {wasteSorted.map((w) => (
+                <div key={w.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{w.sourceName}</p>
+                      <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(w.date)} · {w.qty} {w.unit} · {WASTE_REASONS[w.reason] || w.reason}</p>
+                      {w.notes && <p className="text-[11px] italic mt-0.5" style={{ color: COLORS.textMuted }}>"{w.notes}"</p>}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-sm font-semibold" style={{ color: w.cost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{w.cost > 0 ? rupiah(w.cost) : '-'}</span>
+                      <button onClick={() => removeWaste(w.id)} style={{ color: COLORS.textMuted }}><Trash2 className="w-3.5 h-3.5" /></button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
+
       <div className="pt-4 border-t" style={{ borderColor: COLORS.border }}>
         {!confirmReset ? (
           <button onClick={() => setConfirmReset(true)} className="text-xs" style={{ color: COLORS.textMuted }}>Hapus semua data (stok & riwayat)</button>
