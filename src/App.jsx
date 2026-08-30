@@ -96,6 +96,27 @@ function menuHpp(item, rawMaterials, baseStock) {
   return item.recipeBased ? computeRecipeHpp(item.recipe, rawMaterials, baseStock) : item.purchasePrice || 0;
 }
 
+/* ---------------- HELPERS: terjual bulanan & statistik produksi Base ---------------- */
+function computeMonthlySold(itemName, salesRecords) {
+  const now = new Date();
+  const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const key = itemName.trim().toLowerCase();
+  return salesRecords
+    .filter((r) => r.date.startsWith(monthPrefix))
+    .reduce((sum, r) => sum + r.items.filter((i) => i.name.trim().toLowerCase() === key).reduce((s, i) => s + i.qty, 0), 0);
+}
+function computeBaseProductionStats(baseId, productionLog) {
+  const entries = productionLog.filter((e) => e.baseId === baseId);
+  if (entries.length === 0) return { thisMonth: 0, avgPerMonth: 0 };
+  const now = new Date();
+  const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const thisMonth = entries.filter((e) => e.date.startsWith(monthPrefix)).reduce((s, e) => s + e.unitsProduced, 0);
+  const totalAllTime = entries.reduce((s, e) => s + e.unitsProduced, 0);
+  const firstDate = new Date(entries.map((e) => e.date).sort()[0] + 'T00:00:00');
+  const monthsSpan = (now.getFullYear() - firstDate.getFullYear()) * 12 + (now.getMonth() - firstDate.getMonth()) + 1;
+  return { thisMonth, avgPerMonth: totalAllTime / Math.max(1, monthsSpan) };
+}
+
 /* ---------------- HELPERS: Target Bulanan (Laba Kotor) & Gaji ---------------- */
 function computeTargetStats(employees, bufferAmount, salesRecords) {
   const now = new Date();
@@ -218,10 +239,11 @@ function MainApp({ uid, email }) {
   const [channels, setChannels] = useState([]);
   const [affiliates, setAffiliates] = useState([]);
   const [affiliateSales, setAffiliateSales] = useState([]);
+  const [productionLog, setProductionLog] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales] = await Promise.all([
+      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog] = await Promise.all([
         loadKey(uid, 'raw-materials', []),
         loadKey(uid, 'base-stock', []),
         loadKey(uid, 'finished-stock', []),
@@ -231,6 +253,7 @@ function MainApp({ uid, email }) {
         loadKey(uid, 'channels', []),
         loadKey(uid, 'affiliates', []),
         loadKey(uid, 'affiliate-sales', []),
+        loadKey(uid, 'production-log', []),
       ]);
       setRawMaterials(rm);
       setBaseStock(bs);
@@ -241,6 +264,7 @@ function MainApp({ uid, email }) {
       setChannels(ch);
       setAffiliates(aff);
       setAffiliateSales(affSales);
+      setProductionLog(prodLog);
       setLoading(false);
     })();
   }, [uid]);
@@ -272,6 +296,7 @@ function MainApp({ uid, email }) {
   const saveChannels = (v) => persist('channels', setChannels, v);
   const saveAffiliates = (v) => persist('affiliates', setAffiliates, v);
   const saveAffiliateSales = (v) => persist('affiliate-sales', setAffiliateSales, v);
+  const saveProductionLog = (v) => persist('production-log', setProductionLog, v);
 
   return (
     <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
@@ -282,8 +307,8 @@ function MainApp({ uid, email }) {
         )}
         {activeTab === 'stok' && (
           <StokTab
-            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock}
-            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished}
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} productionLog={productionLog}
+            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveProductionLog={saveProductionLog}
           />
         )}
         {activeTab === 'penjualan' && (
@@ -312,6 +337,7 @@ function MainApp({ uid, email }) {
               await persist('channels', setChannels, []);
               await persist('affiliates', setAffiliates, []);
               await persist('affiliate-sales', setAffiliateSales, []);
+              await persist('production-log', setProductionLog, []);
             }}
           />
         )}
@@ -492,10 +518,11 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
 }
 
 /* ---------------- STOK TAB (3 tingkat: Bahan Baku / Base / Menu Jadi) ---------------- */
-function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase, onSaveFinished }) {
+function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, productionLog, onSaveRaw, onSaveBase, onSaveFinished, onSaveProductionLog }) {
   const [sub, setSub] = useState('bahan');
   const [form, setForm] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState('Semua');
+  const [sortMode, setSortMode] = useState('manual');
   const [producing, setProducing] = useState(null); // { itemId, batches }
 
   const subMeta = {
@@ -505,6 +532,24 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
   };
   const { list, onSave } = subMeta[sub];
   const displayedList = sub !== 'pizza' || categoryFilter === 'Semua' ? list : list.filter((i) => (i.category || 'Lainnya') === categoryFilter);
+
+  const sortedList = sub === 'pizza' && sortMode !== 'manual'
+    ? [...displayedList].sort((a, b) => {
+        if (sortMode === 'margin') {
+          return ((b.sellingPrice || 0) - menuHpp(b, rawMaterials, baseStock)) - ((a.sellingPrice || 0) - menuHpp(a, rawMaterials, baseStock));
+        }
+        if (sortMode === 'terlaris') {
+          return computeMonthlySold(b.name, salesRecords) - computeMonthlySold(a.name, salesRecords);
+        }
+        if (sortMode === 'kontribusi') {
+          const contribA = ((a.sellingPrice || 0) - menuHpp(a, rawMaterials, baseStock)) * computeMonthlySold(a.name, salesRecords);
+          const contribB = ((b.sellingPrice || 0) - menuHpp(b, rawMaterials, baseStock)) * computeMonthlySold(b.name, salesRecords);
+          return contribB - contribA;
+        }
+        if (sortMode === 'az') return a.name.localeCompare(b.name);
+        return 0;
+      })
+    : displayedList;
 
   const openNew = () => {
     if (sub === 'bahan') setForm({ editingId: null, name: '', unit: 'kg', currentStock: '', minStock: '', purchasePrice: '' });
@@ -608,7 +653,9 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
       return { ...rm, currentStock: Math.max(0, rm.currentStock - ing.qty * batches) };
     });
     onSaveRaw(nextRaw);
-    onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: b.currentStock + (b.yieldQty || 1) * batches } : b)));
+    const unitsProduced = (item.yieldQty || 1) * batches;
+    onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: b.currentStock + unitsProduced } : b)));
+    onSaveProductionLog([...productionLog, { id: genId(), baseId: item.id, date: todayISO(), batches, unitsProduced }]);
     setProducing(null);
   };
 
@@ -634,12 +681,25 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
         </div>
       )}
 
+      {sub === 'pizza' && (
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] shrink-0" style={{ color: COLORS.textMuted }}>Urutkan:</span>
+          <select value={sortMode} onChange={(e) => setSortMode(e.target.value)} className="flex-1 rounded-lg px-2 py-1.5 text-xs border" style={{ background: COLORS.surface, borderColor: COLORS.border, color: COLORS.text }}>
+            <option value="manual" style={{ background: COLORS.surface }}>Manual (atur sendiri)</option>
+            <option value="margin" style={{ background: COLORS.surface }}>Margin per unit tertinggi</option>
+            <option value="terlaris" style={{ background: COLORS.surface }}>Terlaris bulan ini</option>
+            <option value="kontribusi" style={{ background: COLORS.surface }}>Kontribusi laba tertinggi</option>
+            <option value="az" style={{ background: COLORS.surface }}>Nama A-Z</option>
+          </select>
+        </div>
+      )}
+
       {displayedList.length === 0 && !form && (
         <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada {sub === 'bahan' ? 'bahan baku' : sub === 'base' ? 'base' : 'menu'} yang dicatat. Tambahkan item pertama.</p></Card>
       )}
 
       <div className="space-y-2">
-        {displayedList.map((item, idx) => {
+        {(sub === 'pizza' ? sortedList : displayedList).map((item, idx) => {
           if (sub === 'bahan') {
             const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
             return (
@@ -671,12 +731,14 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
             const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
             const unitCost = computeBaseUnitCost(item, rawMaterials);
             const isProducingThis = producing && producing.itemId === item.id;
+            const prodStats = computeBaseProductionStats(item.id, productionLog);
             return (
               <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{item.name}</p>
                     <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Biaya: {rupiah(unitCost)}/{item.unit} · Hasil {item.yieldQty || 1} {item.unit}/resep</p>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Produksi bulan ini: <span style={{ color: COLORS.text }}>{prodStats.thisMonth} {item.unit}</span> · Rata-rata/bulan: <span style={{ color: COLORS.text }}>{prodStats.avgPerMonth.toFixed(1)} {item.unit}</span></p>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />
@@ -721,6 +783,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
           const makeable = item.recipeBased ? computeMakeablePortions(item.recipe, rawMaterials, baseStock) : null;
           const hpp = menuHpp(item, rawMaterials, baseStock);
           const margin = (item.sellingPrice || 0) - hpp;
+          const monthlySold = computeMonthlySold(item.name, salesRecords);
           return (
             <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
               <div className="flex items-start justify-between gap-2">
@@ -733,9 +796,10 @@ function StokTab({ rawMaterials, baseStock, finishedStock, onSaveRaw, onSaveBase
                   <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
                     Jual: {rupiah(item.sellingPrice)} · HPP: {rupiah(hpp)} · <span style={{ color: margin >= 0 ? COLORS.secondary : COLORS.primaryLight }}>Margin: {rupiah(margin)}</span>
                   </p>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Terjual bulan ini: <span style={{ color: COLORS.text }}>{monthlySold} {item.unit}</span></p>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
-                  {<ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                  {sortMode === 'manual' && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
                   <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                   <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                 </div>
