@@ -257,10 +257,11 @@ function MainApp({ uid, email }) {
   const [affiliateSales, setAffiliateSales] = useState([]);
   const [productionLog, setProductionLog] = useState([]);
   const [wasteLog, setWasteLog] = useState([]);
+  const [purchaseLog, setPurchaseLog] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog, waste] = await Promise.all([
+      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog, waste, purchases] = await Promise.all([
         loadKey(uid, 'raw-materials', []),
         loadKey(uid, 'base-stock', []),
         loadKey(uid, 'finished-stock', []),
@@ -272,6 +273,7 @@ function MainApp({ uid, email }) {
         loadKey(uid, 'affiliate-sales', []),
         loadKey(uid, 'production-log', []),
         loadKey(uid, 'waste-log', []),
+        loadKey(uid, 'purchase-log', []),
       ]);
       setRawMaterials(rm);
       setBaseStock(bs);
@@ -284,6 +286,7 @@ function MainApp({ uid, email }) {
       setAffiliateSales(affSales);
       setProductionLog(prodLog);
       setWasteLog(waste);
+      setPurchaseLog(purchases);
       setLoading(false);
     })();
   }, [uid]);
@@ -317,13 +320,14 @@ function MainApp({ uid, email }) {
   const saveAffiliateSales = (v) => persist('affiliate-sales', setAffiliateSales, v);
   const saveProductionLog = (v) => persist('production-log', setProductionLog, v);
   const saveWasteLog = (v) => persist('waste-log', setWasteLog, v);
+  const savePurchaseLog = (v) => persist('purchase-log', setPurchaseLog, v);
 
   return (
     <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <Header saving={saving} email={email} />
       <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 max-w-md w-full mx-auto">
         {activeTab === 'dashboard' && (
-          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} />
+          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} purchaseLog={purchaseLog} />
         )}
         {activeTab === 'stok' && (
           <StokTab
@@ -342,6 +346,7 @@ function MainApp({ uid, email }) {
             employees={employees} targetSettings={targetSettings} salesRecords={salesRecords}
             onSaveEmployees={saveEmployees} onSaveTargetSettings={saveTargetSettings}
             affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={saveAffiliates} onSaveAffiliateSales={saveAffiliateSales}
+            rawMaterials={rawMaterials} purchaseLog={purchaseLog} onSaveRaw={saveRaw} onSavePurchaseLog={savePurchaseLog}
           />
         )}
         {activeTab === 'riwayat' && (
@@ -359,6 +364,7 @@ function MainApp({ uid, email }) {
               await persist('affiliate-sales', setAffiliateSales, []);
               await persist('production-log', setProductionLog, []);
               await persist('waste-log', setWasteLog, []);
+              await persist('purchase-log', setPurchaseLog, []);
             }}
           />
         )}
@@ -499,7 +505,7 @@ function TrendChart({ data }) {
   );
 }
 
-function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings, wasteLog }) {
+function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings, wasteLog, purchaseLog }) {
   const today = todayISO();
   const todayRecords = salesRecords.filter((r) => r.date === today);
   const todayTotal = todayRecords.reduce((s, r) => s + r.total, 0);
@@ -542,6 +548,7 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
   }
 
   const wasteThisMonth = wasteLog.filter((w) => w.date.startsWith(thisMonthPrefix)).reduce((s, w) => s + w.cost, 0);
+  const purchaseThisMonth = purchaseLog.filter((p) => p.date.startsWith(thisMonthPrefix)).reduce((s, p) => s + p.totalCost, 0);
 
   const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
   const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
@@ -598,6 +605,13 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
             <p className="text-[11px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
           </Card>
         </div>
+        <Card className="mt-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5" style={{ color: COLORS.textMuted }}><Truck className="w-3.5 h-3.5" /><span className="text-[11px]">Pengeluaran belanja bahan baku bulan ini</span></div>
+            <span className="font-display text-base font-semibold" style={{ color: COLORS.text }}>{rupiah(purchaseThisMonth)}</span>
+          </div>
+          <p className="text-[10px] mt-1" style={{ color: COLORS.textMuted }}>Uang keluar buat belanja — beda dari HPP (biaya bahan yang sudah terjual)</p>
+        </Card>
       </div>
 
       <div>
@@ -1750,21 +1764,169 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
     </div>
   );
 }
-function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales }) {
+
+/* ---------------- PURCHASE TAB (Belanja Bahan Baku) ---------------- */
+function PurchaseTab({ rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }) {
+  const [entry, setEntry] = useState({ rawMaterialId: '', date: todayISO(), qty: '', price: '', notes: '' });
+  const [expandedMonth, setExpandedMonth] = useState(null);
+
+  const updatePurchasePriceIfLatest = (rawMaterialId, allEntries) => {
+    const entriesForItem = allEntries.filter((e) => e.rawMaterialId === rawMaterialId);
+    if (entriesForItem.length === 0) return;
+    const latest = entriesForItem.reduce((a, b) => (a.date >= b.date ? a : b));
+    onSaveRaw(rawMaterials.map((rm) => (rm.id === rawMaterialId ? { ...rm, purchasePrice: latest.price } : rm)));
+  };
+
+  const selectedItem = rawMaterials.find((r) => r.id === entry.rawMaterialId);
+  const previewTotal = (parseFloat(entry.qty) || 0) * (parseFloat(entry.price) || 0);
+
+  const onSelectItem = (id) => {
+    const item = rawMaterials.find((r) => r.id === id);
+    setEntry({ ...entry, rawMaterialId: id, price: item ? String(item.purchasePrice || '') : '' });
+  };
+
+  const submit = () => {
+    const qty = parseFloat(entry.qty) || 0;
+    const price = parseFloat(entry.price) || 0;
+    if (!selectedItem || qty <= 0 || price <= 0) return;
+    const newEntry = { id: genId(), date: entry.date, rawMaterialId: selectedItem.id, rawMaterialName: selectedItem.name, qty, unit: selectedItem.unit, price, totalCost: qty * price, notes: entry.notes.trim() };
+    const nextLog = [...purchaseLog, newEntry];
+    onSavePurchaseLog(nextLog);
+    onSaveRaw(rawMaterials.map((rm) => (rm.id === selectedItem.id ? { ...rm, currentStock: rm.currentStock + qty } : rm)));
+    updatePurchasePriceIfLatest(selectedItem.id, nextLog);
+    setEntry({ rawMaterialId: '', date: entry.date, qty: '', price: '', notes: '' });
+  };
+
+  const removeEntry = (id) => {
+    const target = purchaseLog.find((e) => e.id === id);
+    if (!target) return;
+    onSaveRaw(rawMaterials.map((rm) => (rm.id === target.rawMaterialId ? { ...rm, currentStock: Math.max(0, rm.currentStock - target.qty) } : rm)));
+    const nextLog = purchaseLog.filter((e) => e.id !== id);
+    onSavePurchaseLog(nextLog);
+    updatePurchasePriceIfLatest(target.rawMaterialId, nextLog);
+  };
+
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+  const todayTotal = purchaseLog.filter((e) => e.date === today).reduce((s, e) => s + e.totalCost, 0);
+  const monthTotal = purchaseLog.filter((e) => e.date.startsWith(monthPrefix)).reduce((s, e) => s + e.totalCost, 0);
+
+  const byMonth = {};
+  purchaseLog.forEach((e) => { const mp = e.date.slice(0, 7); (byMonth[mp] = byMonth[mp] || []).push(e); });
+  const monthKeys = Object.keys(byMonth).sort((a, b) => (a < b ? 1 : -1));
+  const monthLabelOf = (mp) => new Date(mp + '-01T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Belanja hari ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(todayTotal)}</p>
+        </Card>
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Belanja bulan ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(monthTotal)}</p>
+          <p className="text-[10px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Catat Belanja Bahan Baku</SectionLabel>
+        <Card>
+          <div className="space-y-2.5">
+            <Field label="Bahan Baku">
+              <select value={entry.rawMaterialId} onChange={(e) => onSelectItem(e.target.value)} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>Pilih bahan baku</option>
+                {rawMaterials.map((rm) => <option key={rm.id} value={rm.id} style={{ background: COLORS.surface }}>{rm.name} ({rm.unit})</option>)}
+              </select>
+            </Field>
+            <Field label="Tanggal (bisa tanggal yang sudah lewat)">
+              <input type="date" value={entry.date} max={todayISO()} onChange={(e) => setEntry({ ...entry, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} />
+            </Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label={`Qty${selectedItem ? ` (${selectedItem.unit})` : ''}`}>
+                <input type="number" value={entry.qty} onChange={(e) => setEntry({ ...entry, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+              <Field label="Harga per Satuan">
+                <input type="number" value={entry.price} onChange={(e) => setEntry({ ...entry, price: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+            </div>
+            <Field label="Catatan (opsional)">
+              <input value={entry.notes} onChange={(e) => setEntry({ ...entry, notes: e.target.value })} placeholder="Contoh: beli di Pasar Kliwon" className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+            </Field>
+          </div>
+          <div className="rounded-lg px-3 py-2 mt-2.5 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+            <span style={{ color: COLORS.textMuted }}>Total Belanja</span>
+            <span className="font-semibold font-display" style={{ color: COLORS.text }}>{rupiah(previewTotal)}</span>
+          </div>
+          <button onClick={submit} disabled={!selectedItem || !(parseFloat(entry.qty) > 0) || !(parseFloat(entry.price) > 0)} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+            <Save className="w-4 h-4" /> Simpan Belanja
+          </button>
+          <p className="text-[10px] mt-2" style={{ color: COLORS.textMuted }}>Stok bahan baku otomatis bertambah, dan harga beli default-nya ikut ter-update ke harga terbaru yang tercatat.</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Riwayat Belanja</SectionLabel>
+        {monthKeys.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan belanja.</p></Card>
+        ) : (
+          <div className="space-y-2">
+            {monthKeys.map((mp) => {
+              const isOpen = expandedMonth === mp;
+              const entries = [...byMonth[mp]].sort((a, b) => (a.date < b.date ? 1 : -1));
+              const total = entries.reduce((s, e) => s + e.totalCost, 0);
+              return (
+                <div key={mp} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                  <button onClick={() => setExpandedMonth(isOpen ? null : mp)} className="w-full flex items-center justify-between px-3.5 py-3">
+                    <span className="text-sm font-medium" style={{ color: COLORS.text }}>{monthLabelOf(mp)}{mp === monthPrefix ? ' (bulan ini)' : ''}</span>
+                    <span className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(total)}</span>
+                  </button>
+                  {isOpen && (
+                    <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                      {entries.map((e) => (
+                        <div key={e.id} className="flex items-start justify-between text-sm mt-2">
+                          <div className="min-w-0">
+                            <p style={{ color: COLORS.text }}>{e.rawMaterialName} <span style={{ color: COLORS.textMuted }}>· {e.qty} {e.unit} × {rupiah(e.price)}</span></p>
+                            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(e.date)}{e.notes ? ` · "${e.notes}"` : ''}</p>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="font-medium" style={{ color: COLORS.text }}>{rupiah(e.totalCost)}</span>
+                            <button onClick={() => removeEntry(e.id)} style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }) {
   const [sub, setSub] = useState('gaji');
   return (
     <div className="space-y-4">
       <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
-        {[{ id: 'gaji', label: 'Target Gaji' }, { id: 'afiliator', label: 'Afiliator' }].map((t) => (
-          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+        {[{ id: 'gaji', label: 'Target Gaji' }, { id: 'afiliator', label: 'Afiliator' }, { id: 'belanja', label: 'Belanja Bahan' }].map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-xs font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
             {t.label}
           </button>
         ))}
       </div>
-      {sub === 'gaji' ? (
+      {sub === 'gaji' && (
         <TargetTab employees={employees} targetSettings={targetSettings} salesRecords={salesRecords} onSaveEmployees={onSaveEmployees} onSaveTargetSettings={onSaveTargetSettings} />
-      ) : (
+      )}
+      {sub === 'afiliator' && (
         <AffiliateTab affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={onSaveAffiliates} onSaveAffiliateSales={onSaveAffiliateSales} />
+      )}
+      {sub === 'belanja' && (
+        <PurchaseTab rawMaterials={rawMaterials} purchaseLog={purchaseLog} onSaveRaw={onSaveRaw} onSavePurchaseLog={onSavePurchaseLog} />
       )}
     </div>
   );
