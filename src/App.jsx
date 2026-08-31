@@ -4,8 +4,9 @@ import {
   Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
   AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown
 } from 'lucide-react';
-import { auth } from './firebase';
+import { auth, db } from './firebase';
 import { loadKey, saveKey } from './store';
+import { collection, onSnapshot, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 
 const COLORS = {
   bg: '#1C1410',
@@ -258,6 +259,25 @@ function MainApp({ uid, email }) {
   const [productionLog, setProductionLog] = useState([]);
   const [wasteLog, setWasteLog] = useState([]);
   const [purchaseLog, setPurchaseLog] = useState([]);
+  const [pendingOrders, setPendingOrders] = useState([]);
+
+  // Dengarkan "Pesanan Masuk" dari website publik secara realtime.
+  // Disimpan sebagai dokumen terpisah per pesanan (bukan satu array besar)
+  // supaya beberapa checkout yang terjadi bersamaan tidak saling menimpa.
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, 'users', uid, 'incoming_orders'), (snap) => {
+      const orders = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((o) => o.status === 'pending')
+        .sort((a, b) => {
+          const ta = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+          const tb = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+          return tb - ta;
+        });
+      setPendingOrders(orders);
+    }, (err) => console.error('Gagal memuat pesanan masuk', err));
+    return () => unsub();
+  }, [uid]);
 
   useEffect(() => {
     (async () => {
@@ -322,6 +342,84 @@ function MainApp({ uid, email }) {
   const saveWasteLog = (v) => persist('waste-log', setWasteLog, v);
   const savePurchaseLog = (v) => persist('purchase-log', setPurchaseLog, v);
 
+  // Mengonfirmasi satu pesanan dari website: menambahkannya ke rekap penjualan
+  // channel "Website" pada tanggal pesanan tersebut (menambah baris, bukan
+  // menimpa item yang sudah ada di hari itu), lalu memotong stok bahan baku /
+  // base / produk jadi sesuai item yang dikonfirmasi saja. Baru pada titik ini
+  // pesanan mempengaruhi laporan keuangan & stok -- itulah sebabnya pesanan
+  // ditahan dulu sebagai "pending" alih-alih langsung tercatat saat checkout.
+  const confirmIncomingOrder = async (order) => {
+    const dateISO = order.createdAt?.toDate ? order.createdAt.toDate().toISOString().slice(0, 10) : todayISO();
+    const channelName = 'Website';
+
+    if (!channels.some((c) => c.name === channelName)) {
+      saveChannels([...channels, { id: genId(), name: channelName }]);
+    }
+
+    const orderItems = (order.items || []).map((i) => {
+      const match = finishedStock.find((f) => f.name.trim().toLowerCase() === (i.name || '').trim().toLowerCase());
+      const hpp = match ? menuHpp(match, rawMaterials, baseStock) : 0;
+      return { name: (i.name || '').trim(), qty: i.qty || 0, price: i.price || 0, hpp };
+    });
+
+    const prevRecord = salesRecords.find((r) => r.date === dateISO && r.channel === channelName);
+    const combinedItems = prevRecord ? [...prevRecord.items, ...orderItems] : orderItems;
+    const totalRevenue = combinedItems.reduce((s, i) => s + i.qty * i.price, 0);
+    const totalHpp = combinedItems.reduce((s, i) => s + i.qty * i.hpp, 0);
+    const record = {
+      id: prevRecord ? prevRecord.id : genId(),
+      date: dateISO,
+      channel: channelName,
+      items: combinedItems,
+      total: totalRevenue,
+      hpp: totalHpp,
+      margin: totalRevenue - totalHpp,
+      notes: prevRecord ? prevRecord.notes || '' : (order.customerName ? `Pesanan online: ${order.customerName}` : ''),
+      updatedAt: new Date().toISOString(),
+    };
+    const nextRecords = prevRecord ? salesRecords.map((r) => (r.id === prevRecord.id ? record : r)) : [...salesRecords, record];
+    await saveSales(nextRecords);
+
+    // Potong stok HANYA untuk item pesanan yang baru dikonfirmasi ini
+    // (item yang sudah ada sebelumnya di rekap hari itu sudah pernah dipotong).
+    let nextFinished = finishedStock;
+    const rawDeltaMap = {};
+    const baseDeltaMap = {};
+    orderItems.forEach((oi) => {
+      const match = finishedStock.find((f) => f.name.trim().toLowerCase() === oi.name.toLowerCase());
+      if (!match || oi.qty <= 0) return;
+      if (match.recipeBased) {
+        (match.recipe || []).forEach((ing) => {
+          const type = ingSourceType(ing);
+          const id = ingSourceId(ing);
+          if (type === 'base') baseDeltaMap[id] = (baseDeltaMap[id] || 0) + ing.qty * oi.qty;
+          else rawDeltaMap[id] = (rawDeltaMap[id] || 0) + ing.qty * oi.qty;
+        });
+      } else {
+        nextFinished = nextFinished.map((f) => (f.id === match.id ? { ...f, currentStock: Math.max(0, f.currentStock - oi.qty) } : f));
+      }
+    });
+    if (nextFinished !== finishedStock) await saveFinished(nextFinished);
+    if (Object.keys(rawDeltaMap).length > 0) {
+      await saveRaw(rawMaterials.map((rm) => (rawDeltaMap[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDeltaMap[rm.id]) } : rm)));
+    }
+    if (Object.keys(baseDeltaMap).length > 0) {
+      await saveBase(baseStock.map((b) => (baseDeltaMap[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDeltaMap[b.id]) } : b)));
+    }
+
+    await updateDoc(doc(db, 'users', uid, 'incoming_orders', order.id), {
+      status: 'confirmed',
+      confirmedAt: serverTimestamp(),
+    });
+  };
+
+  const rejectIncomingOrder = async (order) => {
+    await updateDoc(doc(db, 'users', uid, 'incoming_orders', order.id), {
+      status: 'rejected',
+      rejectedAt: serverTimestamp(),
+    });
+  };
+
   return (
     <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <Header saving={saving} email={email} />
@@ -339,6 +437,7 @@ function MainApp({ uid, email }) {
           <PenjualanTab
             rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} channels={channels}
             onSaveSales={saveSales} onSaveFinished={saveFinished} onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveChannels={saveChannels}
+            pendingOrders={pendingOrders} onConfirmOrder={confirmIncomingOrder} onRejectOrder={rejectIncomingOrder}
           />
         )}
         {activeTab === 'keuangan' && (
@@ -373,9 +472,17 @@ function MainApp({ uid, email }) {
         {TABS.map((t) => {
           const Icon = t.icon;
           const active = activeTab === t.id;
+          const showBadge = t.id === 'penjualan' && pendingOrders.length > 0;
           return (
-            <button key={t.id} onClick={() => setActiveTab(t.id)} className="flex-1 flex flex-col items-center gap-1 py-2.5 transition-colors" style={{ color: active ? COLORS.primaryLight : COLORS.textMuted }}>
-              <Icon className="w-5 h-5" strokeWidth={active ? 2.5 : 2} />
+            <button key={t.id} onClick={() => setActiveTab(t.id)} className="flex-1 flex flex-col items-center gap-1 py-2.5 transition-colors relative" style={{ color: active ? COLORS.primaryLight : COLORS.textMuted }}>
+              <span className="relative">
+                <Icon className="w-5 h-5" strokeWidth={active ? 2.5 : 2} />
+                {showBadge && (
+                  <span className="absolute -top-1 -right-1.5 min-w-[15px] h-[15px] px-[3px] rounded-full text-[9px] font-bold flex items-center justify-center" style={{ background: COLORS.primary, color: '#fff' }}>
+                    {pendingOrders.length}
+                  </span>
+                )}
+              </span>
               <span className="text-[11px] font-medium">{t.label}</span>
             </button>
           );
@@ -1254,7 +1361,59 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
 }
 
 /* ---------------- PENJUALAN TAB ---------------- */
-function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, channels, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase, onSaveChannels }) {
+function IncomingOrdersPanel({ orders, onConfirm, onReject }) {
+  const [busyId, setBusyId] = useState(null);
+  if (!orders || orders.length === 0) return null;
+
+  const handle = async (fn, order) => {
+    setBusyId(order.id);
+    try {
+      await fn(order);
+    } catch (e) {
+      console.error(e);
+      alert('Gagal memproses pesanan, coba lagi.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <Card className="border-2" style={{ borderColor: COLORS.warning }}>
+      <SectionLabel>🛎️ Pesanan Masuk dari Website ({orders.length})</SectionLabel>
+      <div className="space-y-2.5">
+        {orders.map((o) => {
+          const items = o.items || [];
+          const busy = busyId === o.id;
+          return (
+            <div key={o.id} className="rounded-xl px-3 py-2.5" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+              <div className="flex items-start justify-between gap-2 mb-1.5">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{o.customerName || 'Tanpa nama'}</p>
+                  {o.customerAddress && <p className="text-[11px] truncate" style={{ color: COLORS.textMuted }}>{o.customerAddress}</p>}
+                </div>
+                <span className="text-sm font-display font-semibold shrink-0" style={{ color: COLORS.text }}>{rupiah(o.total)}</span>
+              </div>
+              <div className="space-y-0.5 mb-2">
+                {items.map((i, idx) => (
+                  <p key={idx} className="text-[11px]" style={{ color: COLORS.textMuted }}>{i.qty}× {i.name} {i.size ? `(${i.size})` : ''}</p>
+                ))}
+              </div>
+              <p className="text-[10px] mb-2" style={{ color: COLORS.textMuted }}>Bayar: {o.paymentMethod || '-'}{o.deliveryTime ? ` · Kirim: ${o.deliveryTime}` : ''}</p>
+              <div className="flex gap-2">
+                <button disabled={busy} onClick={() => handle(onReject, o)} className="flex-1 py-2 rounded-lg text-xs font-medium disabled:opacity-50" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Tolak</button>
+                <button disabled={busy} onClick={() => handle(onConfirm, o)} className="flex-1 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.text }}>
+                  {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} Konfirmasi
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, channels, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase, onSaveChannels, pendingOrders, onConfirmOrder, onRejectOrder }) {
   const [date, setDate] = useState(todayISO());
   const [channel, setChannel] = useState('');
   const [showNewChannel, setShowNewChannel] = useState(false);
@@ -1371,6 +1530,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
 
   return (
     <div className="space-y-4">
+      <IncomingOrdersPanel orders={pendingOrders} onConfirm={onConfirmOrder} onReject={onRejectOrder} />
       <Card>
         <SectionLabel>Channel Penjualan</SectionLabel>
         {channels.length === 0 && !showNewChannel && (
