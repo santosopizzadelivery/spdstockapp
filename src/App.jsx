@@ -446,6 +446,7 @@ function MainApp({ uid, email }) {
             onSaveEmployees={saveEmployees} onSaveTargetSettings={saveTargetSettings}
             affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={saveAffiliates} onSaveAffiliateSales={saveAffiliateSales}
             rawMaterials={rawMaterials} purchaseLog={purchaseLog} onSaveRaw={saveRaw} onSavePurchaseLog={savePurchaseLog}
+            finishedStock={finishedStock} onSaveFinished={saveFinished}
           />
         )}
         {activeTab === 'riwayat' && (
@@ -1925,45 +1926,58 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
   );
 }
 
-/* ---------------- PURCHASE TAB (Belanja Bahan Baku) ---------------- */
-function PurchaseTab({ rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }) {
-  const [entry, setEntry] = useState({ rawMaterialId: '', date: todayISO(), qty: '', price: '', notes: '' });
+/* ---------------- PURCHASE TAB (Belanja Bahan Baku + Menu Jadi non-resep) ---------------- */
+function PurchaseTab({ rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
+  const [entry, setEntry] = useState({ sourceType: 'raw', itemId: '', date: todayISO(), qty: '', price: '', notes: '' });
   const [expandedMonth, setExpandedMonth] = useState(null);
 
-  const updatePurchasePriceIfLatest = (rawMaterialId, allEntries) => {
-    const entriesForItem = allEntries.filter((e) => e.rawMaterialId === rawMaterialId);
+  const buyableMenu = finishedStock.filter((f) => !f.recipeBased);
+  const sourceList = entry.sourceType === 'raw' ? rawMaterials : buyableMenu;
+  const saveSourceStock = entry.sourceType === 'raw' ? onSaveRaw : onSaveFinished;
+  const sourceListFor = (type) => (type === 'raw' ? rawMaterials : buyableMenu);
+
+  const updatePurchasePriceIfLatest = (sourceType, itemId, allEntries) => {
+    const entriesForItem = allEntries.filter((e) => e.sourceType === sourceType && e.itemId === itemId);
     if (entriesForItem.length === 0) return;
     const latest = entriesForItem.reduce((a, b) => (a.date >= b.date ? a : b));
-    onSaveRaw(rawMaterials.map((rm) => (rm.id === rawMaterialId ? { ...rm, purchasePrice: latest.price } : rm)));
+    const list = sourceListFor(sourceType);
+    const save = sourceType === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, purchasePrice: latest.price } : it)));
   };
 
-  const selectedItem = rawMaterials.find((r) => r.id === entry.rawMaterialId);
+  const selectedItem = sourceList.find((r) => r.id === entry.itemId);
   const previewTotal = (parseFloat(entry.qty) || 0) * (parseFloat(entry.price) || 0);
 
+  const switchSource = (type) => setEntry({ ...entry, sourceType: type, itemId: '', price: '' });
+
   const onSelectItem = (id) => {
-    const item = rawMaterials.find((r) => r.id === id);
-    setEntry({ ...entry, rawMaterialId: id, price: item ? String(item.purchasePrice || '') : '' });
+    const item = sourceList.find((r) => r.id === id);
+    setEntry({ ...entry, itemId: id, price: item ? String(item.purchasePrice || '') : '' });
   };
 
   const submit = () => {
     const qty = parseFloat(entry.qty) || 0;
     const price = parseFloat(entry.price) || 0;
     if (!selectedItem || qty <= 0 || price <= 0) return;
-    const newEntry = { id: genId(), date: entry.date, rawMaterialId: selectedItem.id, rawMaterialName: selectedItem.name, qty, unit: selectedItem.unit, price, totalCost: qty * price, notes: entry.notes.trim() };
+    const newEntry = { id: genId(), date: entry.date, sourceType: entry.sourceType, itemId: selectedItem.id, itemName: selectedItem.name, qty, unit: selectedItem.unit, price, totalCost: qty * price, notes: entry.notes.trim() };
     const nextLog = [...purchaseLog, newEntry];
     onSavePurchaseLog(nextLog);
-    onSaveRaw(rawMaterials.map((rm) => (rm.id === selectedItem.id ? { ...rm, currentStock: rm.currentStock + qty } : rm)));
-    updatePurchasePriceIfLatest(selectedItem.id, nextLog);
-    setEntry({ rawMaterialId: '', date: entry.date, qty: '', price: '', notes: '' });
+    saveSourceStock(sourceList.map((it) => (it.id === selectedItem.id ? { ...it, currentStock: it.currentStock + qty } : it)));
+    updatePurchasePriceIfLatest(entry.sourceType, selectedItem.id, nextLog);
+    setEntry({ sourceType: entry.sourceType, itemId: '', date: entry.date, qty: '', price: '', notes: '' });
   };
 
   const removeEntry = (id) => {
     const target = purchaseLog.find((e) => e.id === id);
     if (!target) return;
-    onSaveRaw(rawMaterials.map((rm) => (rm.id === target.rawMaterialId ? { ...rm, currentStock: Math.max(0, rm.currentStock - target.qty) } : rm)));
+    const type = target.sourceType || 'raw';
+    const itemId = target.itemId || target.rawMaterialId;
+    const list = sourceListFor(type);
+    const save = type === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, currentStock: Math.max(0, it.currentStock - target.qty) } : it)));
     const nextLog = purchaseLog.filter((e) => e.id !== id);
     onSavePurchaseLog(nextLog);
-    updatePurchasePriceIfLatest(target.rawMaterialId, nextLog);
+    updatePurchasePriceIfLatest(type, itemId, nextLog);
   };
 
   const today = todayISO();
@@ -1991,14 +2005,24 @@ function PurchaseTab({ rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }
       </div>
 
       <div>
-        <SectionLabel>Catat Belanja Bahan Baku</SectionLabel>
+        <SectionLabel>Catat Belanja</SectionLabel>
         <Card>
+          <div className="flex rounded-lg p-1 mb-2.5" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+            {[{ id: 'raw', label: 'Bahan Baku' }, { id: 'menu', label: 'Menu Jadi (Beli Jadi)' }].map((t) => (
+              <button key={t.id} onClick={() => switchSource(t.id)} className="flex-1 py-1.5 rounded-md text-xs font-medium" style={entry.sourceType === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
           <div className="space-y-2.5">
-            <Field label="Bahan Baku">
-              <select value={entry.rawMaterialId} onChange={(e) => onSelectItem(e.target.value)} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
-                <option value="" style={{ background: COLORS.surface }}>Pilih bahan baku</option>
-                {rawMaterials.map((rm) => <option key={rm.id} value={rm.id} style={{ background: COLORS.surface }}>{rm.name} ({rm.unit})</option>)}
+            <Field label={entry.sourceType === 'raw' ? 'Bahan Baku' : 'Menu Jadi'}>
+              <select value={entry.itemId} onChange={(e) => onSelectItem(e.target.value)} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>{entry.sourceType === 'raw' ? 'Pilih bahan baku' : 'Pilih menu jadi'}</option>
+                {sourceList.map((it) => <option key={it.id} value={it.id} style={{ background: COLORS.surface }}>{it.name} ({it.unit})</option>)}
               </select>
+              {entry.sourceType === 'menu' && sourceList.length === 0 && (
+                <p className="text-[10px] pb-1.5" style={{ color: COLORS.warning }}>Belum ada Menu Jadi yang bukan resep (semua masih "Pakai Resep").</p>
+              )}
             </Field>
             <Field label="Tanggal (bisa tanggal yang sudah lewat)">
               <input type="date" value={entry.date} max={todayISO()} onChange={(e) => setEntry({ ...entry, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} />
@@ -2022,7 +2046,7 @@ function PurchaseTab({ rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }
           <button onClick={submit} disabled={!selectedItem || !(parseFloat(entry.qty) > 0) || !(parseFloat(entry.price) > 0)} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
             <Save className="w-4 h-4" /> Simpan Belanja
           </button>
-          <p className="text-[10px] mt-2" style={{ color: COLORS.textMuted }}>Stok bahan baku otomatis bertambah, dan harga beli default-nya ikut ter-update ke harga terbaru yang tercatat.</p>
+          <p className="text-[10px] mt-2" style={{ color: COLORS.textMuted }}>Stok item terkait otomatis bertambah, dan harga beli default-nya ikut ter-update ke harga terbaru yang tercatat.</p>
         </Card>
       </div>
 
@@ -2047,7 +2071,11 @@ function PurchaseTab({ rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }
                       {entries.map((e) => (
                         <div key={e.id} className="flex items-start justify-between text-sm mt-2">
                           <div className="min-w-0">
-                            <p style={{ color: COLORS.text }}>{e.rawMaterialName} <span style={{ color: COLORS.textMuted }}>· {e.qty} {e.unit} × {rupiah(e.price)}</span></p>
+                            <p style={{ color: COLORS.text }}>
+                              {e.itemName || e.rawMaterialName}
+                              <span className="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>{(e.sourceType || 'raw') === 'raw' ? 'Bahan Baku' : 'Menu Jadi'}</span>
+                              <span style={{ color: COLORS.textMuted }}> · {e.qty} {e.unit} × {rupiah(e.price)}</span>
+                            </p>
                             <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(e.date)}{e.notes ? ` · "${e.notes}"` : ''}</p>
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
@@ -2068,7 +2096,7 @@ function PurchaseTab({ rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }
   );
 }
 
-function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog }) {
+function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog, finishedStock, onSaveFinished }) {
   const [sub, setSub] = useState('gaji');
   return (
     <div className="space-y-4">
@@ -2086,7 +2114,7 @@ function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees,
         <AffiliateTab affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={onSaveAffiliates} onSaveAffiliateSales={onSaveAffiliateSales} />
       )}
       {sub === 'belanja' && (
-        <PurchaseTab rawMaterials={rawMaterials} purchaseLog={purchaseLog} onSaveRaw={onSaveRaw} onSavePurchaseLog={onSavePurchaseLog} />
+        <PurchaseTab rawMaterials={rawMaterials} finishedStock={finishedStock} purchaseLog={purchaseLog} onSaveRaw={onSaveRaw} onSaveFinished={onSaveFinished} onSavePurchaseLog={onSavePurchaseLog} />
       )}
     </div>
   );
