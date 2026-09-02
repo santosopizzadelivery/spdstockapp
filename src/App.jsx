@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
-  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown
+  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown, Megaphone, Percent, Bell, Trophy, RotateCcw, BadgeCheck
 } from 'lucide-react';
 import { auth, db } from './firebase';
 import { loadKey, saveKey } from './store';
@@ -34,7 +34,9 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'stok', label: 'Stok', icon: Package },
   { id: 'penjualan', label: 'Penjualan', icon: Receipt },
+  { id: 'returan', label: 'Returan', icon: RotateCcw },
   { id: 'keuangan', label: 'Keuangan', icon: Wallet },
+  { id: 'marketing', label: 'Marketing', icon: Megaphone },
   { id: 'riwayat', label: 'Riwayat', icon: History },
 ];
 const CATEGORIES = ['Pizza', 'Minuman', 'Pelengkap', 'Lainnya'];
@@ -156,6 +158,24 @@ function weekRangeLabel(startISO) {
 function computeAffiliateCommission(boxQty, combined) {
   return (boxQty || 0) * (5000 + (combined ? 3000 : 0));
 }
+function isPromoActive(promo, dateStr = todayISO()) {
+  return dateStr >= promo.startDate && dateStr <= promo.endDate;
+}
+
+// deltaQty positif = KURANGI stok bahan (dipakai/hilang), negatif = TAMBAH stok bahan (retur bagus/dikembalikan)
+function applyRecipeDeltaGlobal(recipe, deltaQty, rawMaterials, baseStock, onSaveRaw, onSaveBase) {
+  const rawDelta = {};
+  const baseDelta = {};
+  (recipe || []).forEach((ing) => {
+    const type = ingSourceType(ing);
+    const id = ingSourceId(ing);
+    const amount = ing.qty * deltaQty;
+    if (type === 'base') baseDelta[id] = (baseDelta[id] || 0) + amount;
+    else rawDelta[id] = (rawDelta[id] || 0) + amount;
+  });
+  if (Object.keys(rawDelta).length > 0) onSaveRaw(rawMaterials.map((rm) => (rawDelta[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDelta[rm.id]) } : rm)));
+  if (Object.keys(baseDelta).length > 0) onSaveBase(baseStock.map((b) => (baseDelta[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDelta[b.id]) } : b)));
+}
 
 /* ---------------- HELPERS: Kerugian, Retur, Opname, Export ---------------- */
 const WASTE_REASONS = { rusak: 'Rusak', kadaluarsa: 'Kadaluarsa', 'gagal-produksi': 'Gagal Produksi', lainnya: 'Lainnya', 'retur-rusak': 'Retur (Rusak)', 'retur-bagus': 'Retur (Masih Bagus)', opname: 'Penyesuaian Opname' };
@@ -260,6 +280,8 @@ function MainApp({ uid, email }) {
   const [wasteLog, setWasteLog] = useState([]);
   const [purchaseLog, setPurchaseLog] = useState([]);
   const [pendingOrders, setPendingOrders] = useState([]);
+  const [promos, setPromos] = useState([]);
+  const [affiliatePayments, setAffiliatePayments] = useState([]);
 
   // Dengarkan "Pesanan Masuk" dari website publik secara realtime.
   // Disimpan sebagai dokumen terpisah per pesanan (bukan satu array besar)
@@ -281,7 +303,7 @@ function MainApp({ uid, email }) {
 
   useEffect(() => {
     (async () => {
-      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog, waste, purchases] = await Promise.all([
+      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog, waste, purchases, promoList, affPayments] = await Promise.all([
         loadKey(uid, 'raw-materials', []),
         loadKey(uid, 'base-stock', []),
         loadKey(uid, 'finished-stock', []),
@@ -294,6 +316,8 @@ function MainApp({ uid, email }) {
         loadKey(uid, 'production-log', []),
         loadKey(uid, 'waste-log', []),
         loadKey(uid, 'purchase-log', []),
+        loadKey(uid, 'promos', []),
+        loadKey(uid, 'affiliate-payments', []),
       ]);
       setRawMaterials(rm);
       setBaseStock(bs);
@@ -307,6 +331,8 @@ function MainApp({ uid, email }) {
       setProductionLog(prodLog);
       setWasteLog(waste);
       setPurchaseLog(purchases);
+      setPromos(promoList);
+      setAffiliatePayments(affPayments);
       setLoading(false);
     })();
   }, [uid]);
@@ -341,6 +367,8 @@ function MainApp({ uid, email }) {
   const saveProductionLog = (v) => persist('production-log', setProductionLog, v);
   const saveWasteLog = (v) => persist('waste-log', setWasteLog, v);
   const savePurchaseLog = (v) => persist('purchase-log', setPurchaseLog, v);
+  const savePromos = (v) => persist('promos', setPromos, v);
+  const saveAffiliatePayments = (v) => persist('affiliate-payments', setAffiliatePayments, v);
 
   // Mengonfirmasi satu pesanan dari website: menambahkannya ke rekap penjualan
   // channel "Website" pada tanggal pesanan tersebut (menambah baris, bukan
@@ -425,7 +453,7 @@ function MainApp({ uid, email }) {
       <Header saving={saving} email={email} />
       <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 max-w-md w-full mx-auto">
         {activeTab === 'dashboard' && (
-          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} purchaseLog={purchaseLog} />
+          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} purchaseLog={purchaseLog} affiliateSales={affiliateSales} affiliatePayments={affiliatePayments} promos={promos} />
         )}
         {activeTab === 'stok' && (
           <StokTab
@@ -438,20 +466,35 @@ function MainApp({ uid, email }) {
             rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} channels={channels}
             onSaveSales={saveSales} onSaveFinished={saveFinished} onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveChannels={saveChannels}
             pendingOrders={pendingOrders} onConfirmOrder={confirmIncomingOrder} onRejectOrder={rejectIncomingOrder}
+            affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliateSales={saveAffiliateSales}
+          />
+        )}
+        {activeTab === 'returan' && (
+          <ReturanTab
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} wasteLog={wasteLog}
+            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveWasteLog={saveWasteLog}
           />
         )}
         {activeTab === 'keuangan' && (
           <KeuanganTab
             employees={employees} targetSettings={targetSettings} salesRecords={salesRecords}
             onSaveEmployees={saveEmployees} onSaveTargetSettings={saveTargetSettings}
-            affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={saveAffiliates} onSaveAffiliateSales={saveAffiliateSales}
             rawMaterials={rawMaterials} purchaseLog={purchaseLog} onSaveRaw={saveRaw} onSavePurchaseLog={savePurchaseLog}
             finishedStock={finishedStock} onSaveFinished={saveFinished}
+          />
+        )}
+        {activeTab === 'marketing' && (
+          <MarketingTab
+            affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={saveAffiliates} onSaveAffiliateSales={saveAffiliateSales}
+            affiliatePayments={affiliatePayments} onSaveAffiliatePayments={saveAffiliatePayments}
+            promos={promos} onSavePromos={savePromos}
           />
         )}
         {activeTab === 'riwayat' && (
           <RiwayatTab
             salesRecords={salesRecords} onSaveSales={saveSales} wasteLog={wasteLog} onSaveWasteLog={saveWasteLog}
+            affiliateSales={affiliateSales} onSaveAffiliateSales={saveAffiliateSales}
+            purchaseLog={purchaseLog} rawMaterials={rawMaterials} finishedStock={finishedStock} onSaveRaw={saveRaw} onSaveFinished={saveFinished} onSavePurchaseLog={savePurchaseLog}
             onResetAll={async () => {
               await persist('raw-materials', setRawMaterials, []);
               await persist('base-stock', setBaseStock, []);
@@ -465,6 +508,8 @@ function MainApp({ uid, email }) {
               await persist('production-log', setProductionLog, []);
               await persist('waste-log', setWasteLog, []);
               await persist('purchase-log', setPurchaseLog, []);
+              await persist('promos', setPromos, []);
+              await persist('affiliate-payments', setAffiliatePayments, []);
             }}
           />
         )}
@@ -475,16 +520,16 @@ function MainApp({ uid, email }) {
           const active = activeTab === t.id;
           const showBadge = t.id === 'penjualan' && pendingOrders.length > 0;
           return (
-            <button key={t.id} onClick={() => setActiveTab(t.id)} className="flex-1 flex flex-col items-center gap-1 py-2.5 transition-colors relative" style={{ color: active ? COLORS.primaryLight : COLORS.textMuted }}>
+            <button key={t.id} onClick={() => setActiveTab(t.id)} className="flex-1 flex flex-col items-center gap-0.5 py-2 px-0.5 transition-colors relative min-w-0" style={{ color: active ? COLORS.primaryLight : COLORS.textMuted }}>
               <span className="relative">
-                <Icon className="w-5 h-5" strokeWidth={active ? 2.5 : 2} />
+                <Icon className="w-[18px] h-[18px]" strokeWidth={active ? 2.5 : 2} />
                 {showBadge && (
-                  <span className="absolute -top-1 -right-1.5 min-w-[15px] h-[15px] px-[3px] rounded-full text-[9px] font-bold flex items-center justify-center" style={{ background: COLORS.primary, color: '#fff' }}>
+                  <span className="absolute -top-1 -right-1.5 min-w-[14px] h-[14px] px-[3px] rounded-full text-[8px] font-bold flex items-center justify-center" style={{ background: COLORS.primary, color: '#fff' }}>
                     {pendingOrders.length}
                   </span>
                 )}
               </span>
-              <span className="text-[11px] font-medium">{t.label}</span>
+              <span className="text-[9px] font-medium leading-none truncate max-w-full">{t.label}</span>
             </button>
           );
         })}
@@ -526,47 +571,27 @@ function Field({ label, children }) {
   );
 }
 function WasteFormPanel({ item, sub, wasteForm, setWasteForm, onCancel, onSubmit, rawMaterials, baseStock }) {
-  const isPizza = sub === 'pizza';
   const qty = parseFloat(wasteForm.qty) || 0;
-  const estCost = wasteForm.mode === 'kerugian'
-    ? qty * (sub === 'pizza' ? menuHpp(item, rawMaterials, baseStock) : sub === 'base' ? computeBaseUnitCost(item, rawMaterials) : (item.purchasePrice || 0))
-    : (wasteForm.kondisi === 'rusak' ? qty * menuHpp(item, rawMaterials, baseStock) : 0);
+  const estCost = qty * (sub === 'pizza' ? menuHpp(item, rawMaterials, baseStock) : sub === 'base' ? computeBaseUnitCost(item, rawMaterials) : (item.purchasePrice || 0));
 
   return (
     <div className="mt-3 pt-3 border-t space-y-2.5" style={{ borderColor: COLORS.border }}>
-      {isPizza && (
-        <div className="flex rounded-lg p-1" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
-          {[{ id: 'kerugian', label: 'Kerugian Langsung' }, { id: 'retur', label: 'Retur Pelanggan' }].map((t) => (
-            <button key={t.id} onClick={() => setWasteForm({ ...wasteForm, mode: t.id })} className="flex-1 py-1.5 rounded-md text-xs font-medium" style={wasteForm.mode === t.id ? { background: COLORS.warning, color: COLORS.bg } : { color: COLORS.textMuted }}>
-              {t.label}
-            </button>
-          ))}
-        </div>
-      )}
-
       <Field label={`Jumlah (${item.unit})`}>
         <input type="number" value={wasteForm.qty} onChange={(e) => setWasteForm({ ...wasteForm, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
       </Field>
 
-      {wasteForm.mode === 'kerugian' ? (
-        <Field label="Alasan">
-          <select value={wasteForm.reason} onChange={(e) => setWasteForm({ ...wasteForm, reason: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
-            {['rusak', 'kadaluarsa', 'gagal-produksi', 'lainnya'].map((r) => <option key={r} value={r} style={{ background: COLORS.surface }}>{WASTE_REASONS[r]}</option>)}
-          </select>
-        </Field>
-      ) : (
-        <button type="button" onClick={() => setWasteForm({ ...wasteForm, kondisi: wasteForm.kondisi === 'bagus' ? 'rusak' : 'bagus' })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: wasteForm.kondisi === 'bagus' ? 'rgba(122,154,87,0.12)' : 'rgba(193,57,31,0.1)' }}>
-          <span style={{ color: COLORS.text }}>Kondisi: {wasteForm.kondisi === 'bagus' ? 'Masih Bagus (masuk stok lagi)' : 'Rusak (jadi biaya kerugian)'}</span>
-          <span className="text-xs font-medium" style={{ color: wasteForm.kondisi === 'bagus' ? COLORS.secondary : COLORS.primaryLight }}>Ganti</span>
-        </button>
-      )}
+      <Field label="Alasan">
+        <select value={wasteForm.reason} onChange={(e) => setWasteForm({ ...wasteForm, reason: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+          {['rusak', 'kadaluarsa', 'gagal-produksi', 'lainnya'].map((r) => <option key={r} value={r} style={{ background: COLORS.surface }}>{WASTE_REASONS[r]}</option>)}
+        </select>
+      </Field>
 
       <Field label="Catatan (opsional)">
         <input value={wasteForm.notes} onChange={(e) => setWasteForm({ ...wasteForm, notes: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
       </Field>
 
       <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
-        <span style={{ color: COLORS.textMuted }}>{wasteForm.mode === 'retur' && wasteForm.kondisi === 'bagus' ? 'Stok akan ditambah, tanpa biaya' : 'Estimasi dampak biaya'}</span>
+        <span style={{ color: COLORS.textMuted }}>Estimasi dampak biaya</span>
         <span className="font-semibold" style={{ color: estCost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{rupiah(estCost)}</span>
       </div>
 
@@ -577,6 +602,138 @@ function WasteFormPanel({ item, sub, wasteForm, setWasteForm, onCancel, onSubmit
     </div>
   );
 }
+/* ---------------- RETURAN TAB (Retur Pelanggan: Bagus -> stok lagi, Rusak -> jadi kerugian) ---------------- */
+function ReturanTab({ rawMaterials, baseStock, finishedStock, wasteLog, onSaveRaw, onSaveBase, onSaveFinished, onSaveWasteLog }) {
+  const [form, setForm] = useState({ itemId: '', date: todayISO(), qty: '', kondisi: 'bagus', notes: '' });
+  const [expandedMonth, setExpandedMonth] = useState(null);
+
+  const selectedItem = finishedStock.find((f) => f.id === form.itemId);
+  const qtyNum = parseFloat(form.qty) || 0;
+  const previewCost = selectedItem && form.kondisi === 'rusak' ? qtyNum * menuHpp(selectedItem, rawMaterials, baseStock) : 0;
+
+  const submit = () => {
+    if (!selectedItem || qtyNum <= 0) return;
+    if (form.kondisi === 'bagus') {
+      if (selectedItem.recipeBased) applyRecipeDeltaGlobal(selectedItem.recipe, -qtyNum, rawMaterials, baseStock, onSaveRaw, onSaveBase);
+      else onSaveFinished(finishedStock.map((f) => (f.id === selectedItem.id ? { ...f, currentStock: f.currentStock + qtyNum } : f)));
+      onSaveWasteLog([...wasteLog, { id: genId(), date: form.date, sourceType: 'pizza', sourceId: selectedItem.id, sourceName: selectedItem.name, qty: qtyNum, unit: selectedItem.unit, cost: 0, reason: 'retur-bagus', notes: form.notes.trim() }]);
+    } else {
+      const cost = qtyNum * menuHpp(selectedItem, rawMaterials, baseStock);
+      onSaveWasteLog([...wasteLog, { id: genId(), date: form.date, sourceType: 'pizza', sourceId: selectedItem.id, sourceName: selectedItem.name, qty: qtyNum, unit: selectedItem.unit, cost, reason: 'retur-rusak', notes: form.notes.trim() }]);
+    }
+    setForm({ itemId: '', date: form.date, qty: '', kondisi: 'bagus', notes: '' });
+  };
+
+  const returOnly = wasteLog.filter((w) => (w.reason || '').startsWith('retur'));
+  const removeEntry = (id) => onSaveWasteLog(wasteLog.filter((w) => w.id !== id));
+
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+  const todayCount = returOnly.filter((w) => w.date === today).length;
+  const monthReturs = returOnly.filter((w) => w.date.startsWith(monthPrefix));
+  const monthCost = monthReturs.reduce((s, w) => s + w.cost, 0);
+
+  const byMonth = {};
+  returOnly.forEach((w) => { const mp = w.date.slice(0, 7); (byMonth[mp] = byMonth[mp] || []).push(w); });
+  const monthKeys = Object.keys(byMonth).sort((a, b) => (a < b ? 1 : -1));
+  const monthLabelOf = (mp) => new Date(mp + '-01T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Retur hari ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{todayCount} kejadian</p>
+        </Card>
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Biaya retur bulan ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(monthCost)}</p>
+          <p className="text-[10px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Catat Retur Pelanggan</SectionLabel>
+        <Card>
+          <div className="space-y-2.5">
+            <Field label="Menu Jadi">
+              <select value={form.itemId} onChange={(e) => setForm({ ...form, itemId: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>Pilih menu</option>
+                {finishedStock.map((f) => <option key={f.id} value={f.id} style={{ background: COLORS.surface }}>{f.name}</option>)}
+              </select>
+            </Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Tanggal">
+                <input type="date" value={form.date} max={todayISO()} onChange={(e) => setForm({ ...form, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} />
+              </Field>
+              <Field label={`Jumlah${selectedItem ? ` (${selectedItem.unit})` : ''}`}>
+                <input type="number" value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+            </div>
+            <button type="button" onClick={() => setForm({ ...form, kondisi: form.kondisi === 'bagus' ? 'rusak' : 'bagus' })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: form.kondisi === 'bagus' ? 'rgba(122,154,87,0.12)' : 'rgba(193,57,31,0.1)' }}>
+              <span style={{ color: COLORS.text }}>Kondisi: {form.kondisi === 'bagus' ? 'Masih Bagus (masuk stok lagi)' : 'Rusak (jadi biaya kerugian)'}</span>
+              <span className="text-xs font-medium" style={{ color: form.kondisi === 'bagus' ? COLORS.secondary : COLORS.primaryLight }}>Ganti</span>
+            </button>
+            <Field label="Catatan (opsional)">
+              <input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+            </Field>
+          </div>
+          <div className="rounded-lg px-3 py-2 mt-2.5 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+            <span style={{ color: COLORS.textMuted }}>{form.kondisi === 'bagus' ? 'Stok akan ditambah, tanpa biaya' : 'Estimasi dampak biaya'}</span>
+            <span className="font-semibold" style={{ color: previewCost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{rupiah(previewCost)}</span>
+          </div>
+          <button onClick={submit} disabled={!selectedItem || qtyNum <= 0} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+            <RotateCcw className="w-4 h-4" /> Simpan Retur
+          </button>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Riwayat Retur</SectionLabel>
+        {monthKeys.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan retur.</p></Card>
+        ) : (
+          <div className="space-y-2">
+            {monthKeys.map((mp) => {
+              const isOpen = expandedMonth === mp;
+              const entries = [...byMonth[mp]].sort((a, b) => (a.date < b.date ? 1 : -1));
+              const total = entries.reduce((s, w) => s + w.cost, 0);
+              return (
+                <div key={mp} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                  <button onClick={() => setExpandedMonth(isOpen ? null : mp)} className="w-full flex items-center justify-between px-3.5 py-3">
+                    <span className="text-sm font-medium" style={{ color: COLORS.text }}>{monthLabelOf(mp)}{mp === monthPrefix ? ' (bulan ini)' : ''}</span>
+                    <span className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{entries.length} kejadian · {rupiah(total)}</span>
+                  </button>
+                  {isOpen && (
+                    <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                      {entries.map((w) => (
+                        <div key={w.id} className="flex items-start justify-between text-sm mt-2">
+                          <div className="min-w-0">
+                            <p style={{ color: COLORS.text }}>
+                              {w.sourceName}
+                              <span className="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style={{ background: w.reason === 'retur-bagus' ? 'rgba(122,154,87,0.15)' : 'rgba(193,57,31,0.15)', color: w.reason === 'retur-bagus' ? COLORS.secondary : COLORS.primaryLight }}>{w.reason === 'retur-bagus' ? 'Bagus' : 'Rusak'}</span>
+                              <span style={{ color: COLORS.textMuted }}> · {w.qty} {w.unit}</span>
+                            </p>
+                            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(w.date)}{w.notes ? ` · "${w.notes}"` : ''}</p>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="font-medium" style={{ color: w.cost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{w.cost > 0 ? rupiah(w.cost) : '-'}</span>
+                            <button onClick={() => removeEntry(w.id)} style={{ color: COLORS.textMuted }}><Trash2 className="w-3.5 h-3.5" /></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ReorderButtons({ index, total, onMoveUp, onMoveDown }) {
   return (
     <div className="flex flex-col gap-0.5 shrink-0">
@@ -613,7 +770,7 @@ function TrendChart({ data }) {
   );
 }
 
-function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings, wasteLog, purchaseLog }) {
+function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings, wasteLog, purchaseLog, affiliateSales, affiliatePayments, promos }) {
   const today = todayISO();
   const todayRecords = salesRecords.filter((r) => r.date === today);
   const todayTotal = todayRecords.reduce((s, r) => s + r.total, 0);
@@ -655,8 +812,24 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
     trend.push({ date: iso, omzet: dayRecords.reduce((s, r) => s + r.total, 0), laba: dayRecords.reduce((s, r) => s + getMargin(r), 0) });
   }
 
-  const wasteThisMonth = wasteLog.filter((w) => w.date.startsWith(thisMonthPrefix)).reduce((s, w) => s + w.cost, 0);
+  const kerugianOnly = wasteLog.filter((w) => !(w.reason || '').startsWith('retur'));
+  const returOnly = wasteLog.filter((w) => (w.reason || '').startsWith('retur'));
+  const wasteThisMonth = kerugianOnly.filter((w) => w.date.startsWith(thisMonthPrefix)).reduce((s, w) => s + w.cost, 0);
+  const returThisMonth = returOnly.filter((w) => w.date.startsWith(thisMonthPrefix));
+  const returCostThisMonth = returThisMonth.reduce((s, w) => s + w.cost, 0);
   const purchaseThisMonth = purchaseLog.filter((p) => p.date.startsWith(thisMonthPrefix)).reduce((s, p) => s + p.totalCost, 0);
+
+  const activePromos = promos.filter((p) => isPromoActive(p));
+
+  // Reminder komisi afiliator: cek minggu SEBELUM minggu berjalan (minggu yg sudah selesai)
+  const lastCompletedWeekStart = (() => {
+    const d = new Date(weekStartISO(today));
+    d.setDate(d.getDate() - 7);
+    return d.toISOString().slice(0, 10);
+  })();
+  const lastWeekEntries = affiliateSales.filter((e) => weekStartISO(e.date) === lastCompletedWeekStart);
+  const lastWeekCommission = lastWeekEntries.reduce((s, e) => s + e.commission, 0);
+  const lastWeekUnpaid = lastWeekCommission > 0 && !affiliatePayments.includes(lastCompletedWeekStart);
 
   const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
   const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
@@ -735,13 +908,56 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
 
       {wasteThisMonth > 0 && (
         <div>
-          <SectionLabel>Kerugian & Retur Bulan Ini</SectionLabel>
+          <SectionLabel>Kerugian Bulan Ini</SectionLabel>
           <Card>
             <div className="flex items-center justify-between">
-              <span className="text-sm" style={{ color: COLORS.textMuted }}>Total biaya dari kerugian/retur rusak</span>
+              <span className="text-sm" style={{ color: COLORS.textMuted }}>Total biaya bahan rusak/kadaluarsa/gagal produksi</span>
               <span className="font-display text-base font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(wasteThisMonth)}</span>
             </div>
           </Card>
+        </div>
+      )}
+
+      {returThisMonth.length > 0 && (
+        <div>
+          <SectionLabel>Returan Bulan Ini</SectionLabel>
+          <Card>
+            <div className="flex items-center justify-between">
+              <span className="text-sm flex items-center gap-1.5" style={{ color: COLORS.textMuted }}><RotateCcw className="w-3.5 h-3.5" />{returThisMonth.length} kejadian retur</span>
+              <span className="font-display text-base font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(returCostThisMonth)}</span>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {activePromos.length > 0 && (
+        <div>
+          <SectionLabel>Promo Berjalan</SectionLabel>
+          <div className="space-y-2">
+            {activePromos.map((p) => (
+              <div key={p.id} className="flex items-center gap-3 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(122,154,87,0.08)', border: `1px solid ${COLORS.secondary}55` }}>
+                <Megaphone className="w-4 h-4 shrink-0" style={{ color: COLORS.secondary }} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{p.name}</p>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Sampai {fmtDate(p.endDate)}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {lastWeekUnpaid && (
+        <div>
+          <SectionLabel>Reminder</SectionLabel>
+          <div className="flex items-center gap-3 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(217,164,65,0.08)', border: `1px solid ${COLORS.warning}55` }}>
+            <Bell className="w-4 h-4 shrink-0" style={{ color: COLORS.warning }} />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium" style={{ color: COLORS.text }}>Komisi afiliator minggu lalu belum dibayar</p>
+              <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{weekRangeLabel(lastCompletedWeekStart)}</p>
+            </div>
+            <span className="font-display text-sm font-semibold shrink-0" style={{ color: COLORS.warning }}>{rupiah(lastWeekCommission)}</span>
+          </div>
         </div>
       )}
 
@@ -762,7 +978,7 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
       )}
 
       <div>
-        <SectionLabel>Target Gaji Bulan Ini · {monthLabel}</SectionLabel>
+        <SectionLabel>Target Penjualan Bulan Ini · {monthLabel}</SectionLabel>
         <Card>
           {t.targetBulanan <= 0 ? (
             <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada data karyawan/buffer — atur di tab Target.</p>
@@ -951,55 +1167,27 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
     setProducing(null);
   };
 
-  // --- kerugian & retur ---
+  // --- kerugian langsung (retur pindah ke halaman Returan tersendiri) ---
   const logWaste = (entry) => onSaveWasteLog([...wasteLog, { id: genId(), date: todayISO(), ...entry }]);
-
-  const applyRecipeDelta = (recipe, deltaQty) => {
-    // deltaQty positif = KURANGI stok bahan (dipakai/hilang), negatif = TAMBAH stok bahan (retur bagus/dikembalikan)
-    const rawDelta = {};
-    const baseDelta = {};
-    (recipe || []).forEach((ing) => {
-      const type = ingSourceType(ing);
-      const id = ingSourceId(ing);
-      const amount = ing.qty * deltaQty;
-      if (type === 'base') baseDelta[id] = (baseDelta[id] || 0) + amount;
-      else rawDelta[id] = (rawDelta[id] || 0) + amount;
-    });
-    if (Object.keys(rawDelta).length > 0) onSaveRaw(rawMaterials.map((rm) => (rawDelta[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDelta[rm.id]) } : rm)));
-    if (Object.keys(baseDelta).length > 0) onSaveBase(baseStock.map((b) => (baseDelta[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDelta[b.id]) } : b)));
-  };
 
   const submitWasteForm = () => {
     const item = finishedStock.find((i) => i.id === wasteForm.itemId) || baseStock.find((i) => i.id === wasteForm.itemId) || rawMaterials.find((i) => i.id === wasteForm.itemId);
     const qty = parseFloat(wasteForm.qty) || 0;
     if (!item || qty <= 0) return;
     const sourceType = sub;
-
-    if (wasteForm.mode === 'kerugian') {
-      let cost = 0;
-      if (sourceType === 'pizza') {
-        cost = qty * menuHpp(item, rawMaterials, baseStock);
-        if (item.recipeBased) applyRecipeDelta(item.recipe, qty);
-        else onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, currentStock: Math.max(0, f.currentStock - qty) } : f)));
-      } else if (sourceType === 'base') {
-        cost = qty * computeBaseUnitCost(item, rawMaterials);
-        onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: Math.max(0, b.currentStock - qty) } : b)));
-      } else {
-        cost = qty * (item.purchasePrice || 0);
-        onSaveRaw(rawMaterials.map((r) => (r.id === item.id ? { ...r, currentStock: Math.max(0, r.currentStock - qty) } : r)));
-      }
-      logWaste({ sourceType, sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost, reason: wasteForm.reason, notes: wasteForm.notes.trim() });
+    let cost = 0;
+    if (sourceType === 'pizza') {
+      cost = qty * menuHpp(item, rawMaterials, baseStock);
+      if (item.recipeBased) applyRecipeDeltaGlobal(item.recipe, qty, rawMaterials, baseStock, onSaveRaw, onSaveBase);
+      else onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, currentStock: Math.max(0, f.currentStock - qty) } : f)));
+    } else if (sourceType === 'base') {
+      cost = qty * computeBaseUnitCost(item, rawMaterials);
+      onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: Math.max(0, b.currentStock - qty) } : b)));
     } else {
-      // retur (khusus Menu Jadi)
-      if (wasteForm.kondisi === 'bagus') {
-        if (item.recipeBased) applyRecipeDelta(item.recipe, -qty);
-        else onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, currentStock: f.currentStock + qty } : f)));
-        logWaste({ sourceType: 'pizza', sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost: 0, reason: 'retur-bagus', notes: wasteForm.notes.trim() });
-      } else {
-        const cost = qty * menuHpp(item, rawMaterials, baseStock);
-        logWaste({ sourceType: 'pizza', sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost, reason: 'retur-rusak', notes: wasteForm.notes.trim() });
-      }
+      cost = qty * (item.purchasePrice || 0);
+      onSaveRaw(rawMaterials.map((r) => (r.id === item.id ? { ...r, currentStock: Math.max(0, r.currentStock - qty) } : r)));
     }
+    logWaste({ sourceType, sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost, reason: wasteForm.reason, notes: wasteForm.notes.trim() });
     setWasteForm(null);
   };
 
@@ -1086,7 +1274,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     {!opnameMode && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
-                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, mode: 'kerugian', qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
+                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
@@ -1127,7 +1315,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     {!opnameMode && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
-                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, mode: 'kerugian', qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
+                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
                     <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                     <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
@@ -1195,7 +1383,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                   {sortMode === 'manual' && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
-                  <button onClick={() => setWasteForm({ itemId: item.id, mode: 'kerugian', qty: '', reason: 'rusak', kondisi: 'bagus', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><Undo2 className="w-3.5 h-3.5" /></button>
+                  <button onClick={() => setWasteForm({ itemId: item.id, qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>
                   <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
                   <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
                 </div>
@@ -1414,14 +1602,16 @@ function IncomingOrdersPanel({ orders, onConfirm, onReject }) {
   );
 }
 
-function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, channels, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase, onSaveChannels, pendingOrders, onConfirmOrder, onRejectOrder }) {
+function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, channels, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase, onSaveChannels, pendingOrders, onConfirmOrder, onRejectOrder, affiliates, affiliateSales, onSaveAffiliateSales }) {
   const [date, setDate] = useState(todayISO());
   const [channel, setChannel] = useState('');
   const [showNewChannel, setShowNewChannel] = useState(false);
   const [newChannelName, setNewChannelName] = useState('');
   const [showManageChannels, setShowManageChannels] = useState(false);
-  const [items, setItems] = useState([{ id: genId(), name: '', qty: '', price: '' }]);
+  const [items, setItems] = useState([{ id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
   const [notes, setNotes] = useState('');
+
+  const isAffiliateEligible = (name) => /d18|d25/i.test(name || '');
 
   useEffect(() => {
     if (!channel && channels.length > 0) setChannel(channels[0].name);
@@ -1431,10 +1621,10 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
     if (!channel) return;
     const existing = salesRecords.find((r) => r.date === date && r.channel === channel);
     if (existing) {
-      setItems(existing.items.map((i) => ({ id: genId(), name: i.name, qty: String(i.qty), price: String(i.price) })));
+      setItems(existing.items.map((i) => ({ id: genId(), name: i.name, qty: String(i.qty), price: String(i.price), affiliateId: i.affiliateId || '' })));
       setNotes(existing.notes || '');
     } else {
-      setItems([{ id: genId(), name: '', qty: '', price: '' }]);
+      setItems([{ id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
       setNotes('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1463,7 +1653,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
       return next;
     }));
   };
-  const addRow = () => setItems([...items, { id: genId(), name: '', qty: '', price: '' }]);
+  const addRow = () => setItems([...items, { id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
   const removeRow = (id) => setItems(items.filter((i) => i.id !== id));
 
   const total = items.reduce((s, i) => s + (parseFloat(i.qty) || 0) * (parseFloat(i.price) || 0), 0);
@@ -1480,7 +1670,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
       .map((i) => {
         const match = findMenu(i.name);
         const hpp = match ? menuHpp(match, rawMaterials, baseStock) : 0;
-        return { name: i.name.trim(), qty: parseFloat(i.qty) || 0, price: parseFloat(i.price) || 0, hpp };
+        return { name: i.name.trim(), qty: parseFloat(i.qty) || 0, price: parseFloat(i.price) || 0, hpp, affiliateId: isAffiliateEligible(i.name) ? (i.affiliateId || '') : '' };
       });
     if (cleanItems.length === 0) return;
 
@@ -1490,6 +1680,16 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
     const record = { id: prevRecord ? prevRecord.id : genId(), date, channel, items: cleanItems, total: totalRevenue, hpp: totalHpp, margin: totalRevenue - totalHpp, notes: notes.trim(), updatedAt: new Date().toISOString() };
     const nextRecords = prevRecord ? salesRecords.map((r) => (r.id === prevRecord.id ? record : r)) : [...salesRecords, record];
     onSaveSales(nextRecords);
+
+    // Sinkronkan komisi afiliator yang tertaut ke transaksi ini: hapus dulu yang lama
+    // (kalau ini edit ulang), lalu buat ulang dari item yang sekarang punya referensi afiliator.
+    const withoutOld = affiliateSales.filter((e) => e.autoFromSaleId !== record.id);
+    const newAffEntries = cleanItems
+      .filter((i) => i.affiliateId)
+      .map((i) => ({ id: genId(), affiliateId: i.affiliateId, date, boxQty: i.qty, combined: false, commission: computeAffiliateCommission(i.qty, false), autoFromSaleId: record.id }));
+    if (withoutOld.length !== affiliateSales.length || newAffEntries.length > 0) {
+      onSaveAffiliateSales([...withoutOld, ...newAffEntries]);
+    }
 
     const prevQty = {};
     (prevRecord ? prevRecord.items : []).forEach((i) => { const key = i.name.trim().toLowerCase(); prevQty[key] = (prevQty[key] || 0) + i.qty; });
@@ -1594,6 +1794,17 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
                   <div className="text-right pb-1.5"><p className="text-[10px]" style={{ color: COLORS.textMuted }}>Subtotal</p><p className="text-sm font-semibold font-display" style={{ color: COLORS.secondary }}>{rupiah(subtotal)}</p></div>
                 </div>
                 {!match && item.name.trim() && <p className="text-[10px] mt-1.5" style={{ color: COLORS.warning }}>Tidak cocok dengan menu manapun — HPP dianggap Rp0.</p>}
+                {isAffiliateEligible(item.name) && (
+                  <div className="mt-2 pt-2 border-t" style={{ borderColor: COLORS.border }}>
+                    <Field label="Referensi Afiliator (opsional)">
+                      <select value={item.affiliateId} onChange={(e) => updateItem(item.id, 'affiliateId', e.target.value)} className="w-full bg-transparent outline-none text-sm py-1.5" style={{ color: COLORS.text }}>
+                        <option value="" style={{ background: COLORS.surface }}>Tidak ada</option>
+                        {affiliates.map((a) => <option key={a.id} value={a.id} style={{ background: COLORS.surface }}>{a.name}</option>)}
+                      </select>
+                    </Field>
+                    {item.affiliateId && <p className="text-[10px] mt-1" style={{ color: COLORS.secondary }}>Komisi Rp{(5000 * (parseFloat(item.qty) || 0)).toLocaleString('id-ID')} otomatis tercatat ke afiliator ini saat disimpan.</p>}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1618,14 +1829,19 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
 }
 
 /* ---------------- RIWAYAT TAB ---------------- */
-function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, onResetAll }) {
+function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, affiliateSales, onSaveAffiliateSales, purchaseLog, rawMaterials, finishedStock, onSaveRaw, onSaveFinished, onSavePurchaseLog, onResetAll }) {
   const [sub, setSub] = useState('penjualan');
   const [expanded, setExpanded] = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const sorted = [...salesRecords].sort((a, b) => (a.date === b.date ? (a.channel || '').localeCompare(b.channel || '') : a.date < b.date ? 1 : -1));
-  const wasteSorted = [...wasteLog].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const kerugianOnly = wasteLog.filter((w) => !(w.reason || '').startsWith('retur'));
+  const wasteSorted = [...kerugianOnly].sort((a, b) => (a.date < b.date ? 1 : -1));
 
-  const remove = (id) => { onSaveSales(salesRecords.filter((r) => r.id !== id)); if (expanded === id) setExpanded(null); };
+  const remove = (id) => {
+    onSaveSales(salesRecords.filter((r) => r.id !== id));
+    onSaveAffiliateSales(affiliateSales.filter((e) => e.autoFromSaleId !== id));
+    if (expanded === id) setExpanded(null);
+  };
   const removeWaste = (id) => onSaveWasteLog(wasteLog.filter((w) => w.id !== id));
 
   const exportSales = () => {
@@ -1638,23 +1854,25 @@ function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, onRes
   const exportWaste = () => {
     const rows = [['Tanggal', 'Sumber', 'Nama Item', 'Qty', 'Satuan', 'Alasan', 'Estimasi Biaya', 'Catatan']];
     wasteSorted.forEach((w) => rows.push([w.date, w.sourceType, w.sourceName, w.qty, w.unit, WASTE_REASONS[w.reason] || w.reason, w.cost, w.notes || '']));
-    downloadCSV(`kerugian-retur-${todayISO()}.csv`, rows);
+    downloadCSV(`kerugian-${todayISO()}.csv`, rows);
   };
 
   const monthPrefix = todayISO().slice(0, 7);
-  const wasteThisMonth = wasteLog.filter((w) => w.date.startsWith(monthPrefix)).reduce((s, w) => s + w.cost, 0);
+  const wasteThisMonth = kerugianOnly.filter((w) => w.date.startsWith(monthPrefix)).reduce((s, w) => s + w.cost, 0);
+
+  const SUB = [{ id: 'penjualan', label: 'Penjualan' }, { id: 'belanja', label: 'Belanja' }, { id: 'kerugian', label: 'Kerugian' }];
 
   return (
     <div className="space-y-4">
       <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
-        {[{ id: 'penjualan', label: 'Penjualan' }, { id: 'kerugian', label: 'Kerugian & Retur' }].map((t) => (
-          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+        {SUB.map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-xs font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
             {t.label}
           </button>
         ))}
       </div>
 
-      {sub === 'penjualan' ? (
+      {sub === 'penjualan' && (
         <>
           <button onClick={exportSales} disabled={sorted.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
             <Download className="w-4 h-4" /> Export ke Excel/CSV
@@ -1692,7 +1910,13 @@ function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, onRes
             </div>
           )}
         </>
-      ) : (
+      )}
+
+      {sub === 'belanja' && (
+        <PurchaseHistoryView purchaseLog={purchaseLog} rawMaterials={rawMaterials} finishedStock={finishedStock} onSaveRaw={onSaveRaw} onSaveFinished={onSaveFinished} onSavePurchaseLog={onSavePurchaseLog} />
+      )}
+
+      {sub === 'kerugian' && (
         <>
           <Card>
             <div className="flex items-center justify-between">
@@ -1704,7 +1928,7 @@ function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, onRes
             <Download className="w-4 h-4" /> Export ke Excel/CSV
           </button>
           {wasteSorted.length === 0 ? (
-            <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan kerugian atau retur.</p></Card>
+            <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan kerugian.</p></Card>
           ) : (
             <div className="space-y-2">
               {wasteSorted.map((w) => (
@@ -1745,7 +1969,7 @@ function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, onRes
 }
 
 /* ---------------- AFFILIATE TAB (Nama Afiliator + Rekap Komisi Mingguan) ---------------- */
-function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales }) {
+function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, affiliatePayments, onSaveAffiliatePayments }) {
   const [affForm, setAffForm] = useState(null); // { editingId, name }
   const [entry, setEntry] = useState({ affiliateId: '', date: todayISO(), boxQty: '', combined: false });
   const [expandedWeek, setExpandedWeek] = useState(null);
@@ -1794,9 +2018,40 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
   const currentWeekEntries = weeks[currentWeekStart] || [];
   const currentWeekSummary = summarizeWeek(currentWeekEntries);
   const currentWeekTotal = Object.values(currentWeekSummary).reduce((s, v) => s + v.commission, 0);
+  const togglePaid = (ws) => onSaveAffiliatePayments(affiliatePayments.includes(ws) ? affiliatePayments.filter((w) => w !== ws) : [...affiliatePayments, ws]);
+
+  // Klasemen bulanan (reset otomatis tiap bulan, murni ranking)
+  const monthPrefix = todayISO().slice(0, 7);
+  const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  const monthEntries = affiliateSales.filter((e) => e.date.startsWith(monthPrefix));
+  const bySumm = summarizeWeek(monthEntries);
+  const klasemen = Object.entries(bySumm).sort((a, b) => b[1].commission - a[1].commission);
 
   return (
     <div className="space-y-4">
+      <div>
+        <SectionLabel>Klasemen Bulan Ini · {monthLabel}</SectionLabel>
+        <Card>
+          {klasemen.length === 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada penjualan afiliator bulan ini.</p>
+          ) : (
+            <div className="space-y-2.5">
+              {klasemen.map(([name, v], idx) => (
+                <div key={name} className="flex items-center gap-3">
+                  <span className="w-6 text-center font-display font-bold text-sm shrink-0" style={{ color: idx === 0 ? COLORS.warning : COLORS.textMuted }}>{idx === 0 ? <Trophy className="w-4 h-4 inline" /> : `#${idx + 1}`}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{name}</p>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{v.boxQty} box terjual</p>
+                  </div>
+                  <span className="font-display font-semibold text-sm shrink-0" style={{ color: COLORS.secondary }}>{rupiah(v.commission)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="text-[10px] mt-2.5 pt-2.5 border-t" style={{ color: COLORS.textMuted, borderColor: COLORS.border }}>Klasemen ranking, reset otomatis tiap bulan. Pembayaran komisi tetap mengikuti siklus mingguan di bawah.</p>
+        </Card>
+      </div>
+
       <div>
         <SectionLabel>Minggu Ini · {weekRangeLabel(currentWeekStart)} (dibayar Minggu)</SectionLabel>
         <Card>
@@ -1889,10 +2144,14 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
               const isOpen = expandedWeek === ws;
               const summary = summarizeWeek(weeks[ws]);
               const total = Object.values(summary).reduce((s, v) => s + v.commission, 0);
+              const isPaid = affiliatePayments.includes(ws);
               return (
-                <div key={ws} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                <div key={ws} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${isPaid ? COLORS.border : COLORS.warning + '66'}` }}>
                   <button onClick={() => setExpandedWeek(isOpen ? null : ws)} className="w-full flex items-center justify-between px-3.5 py-3">
-                    <span className="text-sm font-medium" style={{ color: COLORS.text }}>{weekRangeLabel(ws)}{ws === currentWeekStart ? ' (minggu ini)' : ''}</span>
+                    <span className="text-sm font-medium flex items-center gap-1.5" style={{ color: COLORS.text }}>
+                      {weekRangeLabel(ws)}{ws === currentWeekStart ? ' (minggu ini)' : ''}
+                      {isPaid && <BadgeCheck className="w-3.5 h-3.5" style={{ color: COLORS.secondary }} />}
+                    </span>
                     <span className="font-display text-sm font-semibold" style={{ color: COLORS.secondary }}>{rupiah(total)}</span>
                   </button>
                   {isOpen && (
@@ -1908,12 +2167,15 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
                           const aff = affiliates.find((a) => a.id === e.affiliateId);
                           return (
                             <div key={e.id} className="flex items-center justify-between text-[11px]" style={{ color: COLORS.textMuted }}>
-                              <span>{fmtDate(e.date)} · {aff ? aff.name : '-'} · {e.boxQty} box{e.combined ? ' · gabung kirim' : ''}</span>
+                              <span>{fmtDate(e.date)} · {aff ? aff.name : '-'} · {e.boxQty} box{e.combined ? ' · gabung kirim' : ''}{e.autoFromSaleId ? ' · dari Penjualan' : ''}</span>
                               <button onClick={() => removeEntry(e.id)}><Trash2 className="w-3 h-3" /></button>
                             </div>
                           );
                         })}
                       </div>
+                      <button onClick={() => togglePaid(ws)} className="w-full mt-2 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: isPaid ? COLORS.surfaceLight : COLORS.secondary, color: isPaid ? COLORS.textMuted : COLORS.bg }}>
+                        <BadgeCheck className="w-3.5 h-3.5" /> {isPaid ? 'Sudah Dibayar (batalkan)' : 'Tandai Sudah Dibayar'}
+                      </button>
                     </div>
                   )}
                 </div>
@@ -1927,9 +2189,8 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
 }
 
 /* ---------------- PURCHASE TAB (Belanja Bahan Baku + Menu Jadi non-resep) ---------------- */
-function PurchaseTab({ rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
+function PurchaseEntryTab({ rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
   const [entry, setEntry] = useState({ sourceType: 'raw', itemId: '', date: todayISO(), qty: '', price: '', notes: '' });
-  const [expandedMonth, setExpandedMonth] = useState(null);
 
   const buyableMenu = finishedStock.filter((f) => !f.recipeBased);
   const sourceList = entry.sourceType === 'raw' ? rawMaterials : buyableMenu;
@@ -1967,28 +2228,10 @@ function PurchaseTab({ rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSa
     setEntry({ sourceType: entry.sourceType, itemId: '', date: entry.date, qty: '', price: '', notes: '' });
   };
 
-  const removeEntry = (id) => {
-    const target = purchaseLog.find((e) => e.id === id);
-    if (!target) return;
-    const type = target.sourceType || 'raw';
-    const itemId = target.itemId || target.rawMaterialId;
-    const list = sourceListFor(type);
-    const save = type === 'raw' ? onSaveRaw : onSaveFinished;
-    save(list.map((it) => (it.id === itemId ? { ...it, currentStock: Math.max(0, it.currentStock - target.qty) } : it)));
-    const nextLog = purchaseLog.filter((e) => e.id !== id);
-    onSavePurchaseLog(nextLog);
-    updatePurchasePriceIfLatest(type, itemId, nextLog);
-  };
-
   const today = todayISO();
   const monthPrefix = today.slice(0, 7);
   const todayTotal = purchaseLog.filter((e) => e.date === today).reduce((s, e) => s + e.totalCost, 0);
   const monthTotal = purchaseLog.filter((e) => e.date.startsWith(monthPrefix)).reduce((s, e) => s + e.totalCost, 0);
-
-  const byMonth = {};
-  purchaseLog.forEach((e) => { const mp = e.date.slice(0, 7); (byMonth[mp] = byMonth[mp] || []).push(e); });
-  const monthKeys = Object.keys(byMonth).sort((a, b) => (a < b ? 1 : -1));
-  const monthLabelOf = (mp) => new Date(mp + '-01T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
 
   return (
     <div className="space-y-4">
@@ -2046,62 +2289,218 @@ function PurchaseTab({ rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSa
           <button onClick={submit} disabled={!selectedItem || !(parseFloat(entry.qty) > 0) || !(parseFloat(entry.price) > 0)} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
             <Save className="w-4 h-4" /> Simpan Belanja
           </button>
-          <p className="text-[10px] mt-2" style={{ color: COLORS.textMuted }}>Stok item terkait otomatis bertambah, dan harga beli default-nya ikut ter-update ke harga terbaru yang tercatat.</p>
+          <p className="text-[10px] mt-2" style={{ color: COLORS.textMuted }}>Stok item terkait otomatis bertambah, dan harga beli default-nya ikut ter-update ke harga terbaru yang tercatat. Riwayat lengkapnya ada di tab Riwayat.</p>
         </Card>
-      </div>
-
-      <div>
-        <SectionLabel>Riwayat Belanja</SectionLabel>
-        {monthKeys.length === 0 ? (
-          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan belanja.</p></Card>
-        ) : (
-          <div className="space-y-2">
-            {monthKeys.map((mp) => {
-              const isOpen = expandedMonth === mp;
-              const entries = [...byMonth[mp]].sort((a, b) => (a.date < b.date ? 1 : -1));
-              const total = entries.reduce((s, e) => s + e.totalCost, 0);
-              return (
-                <div key={mp} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
-                  <button onClick={() => setExpandedMonth(isOpen ? null : mp)} className="w-full flex items-center justify-between px-3.5 py-3">
-                    <span className="text-sm font-medium" style={{ color: COLORS.text }}>{monthLabelOf(mp)}{mp === monthPrefix ? ' (bulan ini)' : ''}</span>
-                    <span className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(total)}</span>
-                  </button>
-                  {isOpen && (
-                    <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
-                      {entries.map((e) => (
-                        <div key={e.id} className="flex items-start justify-between text-sm mt-2">
-                          <div className="min-w-0">
-                            <p style={{ color: COLORS.text }}>
-                              {e.itemName || e.rawMaterialName}
-                              <span className="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>{(e.sourceType || 'raw') === 'raw' ? 'Bahan Baku' : 'Menu Jadi'}</span>
-                              <span style={{ color: COLORS.textMuted }}> · {e.qty} {e.unit} × {rupiah(e.price)}</span>
-                            </p>
-                            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(e.date)}{e.notes ? ` · "${e.notes}"` : ''}</p>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            <span className="font-medium" style={{ color: COLORS.text }}>{rupiah(e.totalCost)}</span>
-                            <button onClick={() => removeEntry(e.id)} style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
       </div>
     </div>
   );
 }
 
-function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, rawMaterials, purchaseLog, onSaveRaw, onSavePurchaseLog, finishedStock, onSaveFinished }) {
+/* ---------------- PURCHASE HISTORY (dipakai di dalam RiwayatTab) ---------------- */
+function PurchaseHistoryView({ purchaseLog, rawMaterials, finishedStock, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
+  const [expandedMonth, setExpandedMonth] = useState(null);
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+
+  const sourceListFor = (type) => (type === 'raw' ? rawMaterials : finishedStock);
+  const updatePurchasePriceIfLatest = (sourceType, itemId, allEntries) => {
+    const entriesForItem = allEntries.filter((e) => e.sourceType === sourceType && e.itemId === itemId);
+    if (entriesForItem.length === 0) return;
+    const latest = entriesForItem.reduce((a, b) => (a.date >= b.date ? a : b));
+    const list = sourceListFor(sourceType);
+    const save = sourceType === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, purchasePrice: latest.price } : it)));
+  };
+
+  const removeEntry = (id) => {
+    const target = purchaseLog.find((e) => e.id === id);
+    if (!target) return;
+    const type = target.sourceType || 'raw';
+    const itemId = target.itemId || target.rawMaterialId;
+    const list = sourceListFor(type);
+    const save = type === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, currentStock: Math.max(0, it.currentStock - target.qty) } : it)));
+    const nextLog = purchaseLog.filter((e) => e.id !== id);
+    onSavePurchaseLog(nextLog);
+    updatePurchasePriceIfLatest(type, itemId, nextLog);
+  };
+
+  const exportPurchases = () => {
+    const rows = [['Tanggal', 'Sumber', 'Nama Item', 'Qty', 'Satuan', 'Harga', 'Total', 'Catatan']];
+    [...purchaseLog].sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((e) => rows.push([e.date, (e.sourceType || 'raw') === 'raw' ? 'Bahan Baku' : 'Menu Jadi', e.itemName || e.rawMaterialName, e.qty, e.unit, e.price, e.totalCost, e.notes || '']));
+    downloadCSV(`belanja-${today}.csv`, rows);
+  };
+
+  const byMonth = {};
+  purchaseLog.forEach((e) => { const mp = e.date.slice(0, 7); (byMonth[mp] = byMonth[mp] || []).push(e); });
+  const monthKeys = Object.keys(byMonth).sort((a, b) => (a < b ? 1 : -1));
+  const monthLabelOf = (mp) => new Date(mp + '-01T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+  return (
+    <div className="space-y-4">
+      <button onClick={exportPurchases} disabled={purchaseLog.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
+        <Download className="w-4 h-4" /> Export ke Excel/CSV
+      </button>
+      {monthKeys.length === 0 ? (
+        <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan belanja.</p></Card>
+      ) : (
+        <div className="space-y-2">
+          {monthKeys.map((mp) => {
+            const isOpen = expandedMonth === mp;
+            const entries = [...byMonth[mp]].sort((a, b) => (a.date < b.date ? 1 : -1));
+            const total = entries.reduce((s, e) => s + e.totalCost, 0);
+            return (
+              <div key={mp} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                <button onClick={() => setExpandedMonth(isOpen ? null : mp)} className="w-full flex items-center justify-between px-3.5 py-3">
+                  <span className="text-sm font-medium" style={{ color: COLORS.text }}>{monthLabelOf(mp)}{mp === monthPrefix ? ' (bulan ini)' : ''}</span>
+                  <span className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(total)}</span>
+                </button>
+                {isOpen && (
+                  <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                    {entries.map((e) => (
+                      <div key={e.id} className="flex items-start justify-between text-sm mt-2">
+                        <div className="min-w-0">
+                          <p style={{ color: COLORS.text }}>
+                            {e.itemName || e.rawMaterialName}
+                            <span className="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>{(e.sourceType || 'raw') === 'raw' ? 'Bahan Baku' : 'Menu Jadi'}</span>
+                            <span style={{ color: COLORS.textMuted }}> · {e.qty} {e.unit} × {rupiah(e.price)}</span>
+                          </p>
+                          <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(e.date)}{e.notes ? ` · "${e.notes}"` : ''}</p>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-medium" style={{ color: COLORS.text }}>{rupiah(e.totalCost)}</span>
+                          <button onClick={() => removeEntry(e.id)} style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- PROMO TAB ---------------- */
+function PromoTab({ promos, onSavePromos }) {
+  const [form, setForm] = useState(null); // { editingId, name, startDate, endDate, description }
+
+  const openNew = () => setForm({ editingId: null, name: '', startDate: todayISO(), endDate: todayISO(), description: '' });
+  const openEdit = (p) => setForm({ editingId: p.id, name: p.name, startDate: p.startDate, endDate: p.endDate, description: p.description || '' });
+  const submit = () => {
+    if (!form.name.trim() || !form.startDate || !form.endDate) return;
+    const payload = { id: form.editingId || genId(), name: form.name.trim(), startDate: form.startDate, endDate: form.endDate, description: form.description.trim() };
+    onSavePromos(form.editingId ? promos.map((p) => (p.id === form.editingId ? payload : p)) : [...promos, payload]);
+    setForm(null);
+  };
+  const remove = (id) => onSavePromos(promos.filter((p) => p.id !== id));
+
+  const sorted = [...promos].sort((a, b) => (a.startDate < b.startDate ? 1 : -1));
+  const active = sorted.filter((p) => isPromoActive(p));
+  const upcoming = sorted.filter((p) => p.startDate > todayISO());
+  const past = sorted.filter((p) => p.endDate < todayISO());
+
+  const PromoCard = ({ p, status }) => (
+    <div className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${status === 'active' ? COLORS.secondary + '88' : COLORS.border}` }}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{p.name}</p>
+            {status === 'active' && <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: 'rgba(122,154,87,0.15)', color: COLORS.secondary }}>Berjalan</span>}
+            {status === 'upcoming' && <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: COLORS.surfaceLight, color: COLORS.warning }}>Akan Datang</span>}
+          </div>
+          <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(p.startDate)} – {fmtDate(p.endDate)}</p>
+          {p.description && <p className="text-[11px] mt-1" style={{ color: COLORS.textMuted }}>{p.description}</p>}
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          <button onClick={() => openEdit(p)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+          <button onClick={() => remove(p.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <SectionLabel>Promo Berjalan Bulan Ini</SectionLabel>
+        {active.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Tidak ada promo yang sedang berjalan.</p></Card>
+        ) : (
+          <div className="space-y-2">{active.map((p) => <PromoCard key={p.id} p={p} status="active" />)}</div>
+        )}
+      </div>
+
+      {upcoming.length > 0 && (
+        <div>
+          <SectionLabel>Akan Datang</SectionLabel>
+          <div className="space-y-2">{upcoming.map((p) => <PromoCard key={p.id} p={p} status="upcoming" />)}</div>
+        </div>
+      )}
+
+      {!form && (
+        <button onClick={openNew} className="w-full py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+          <Plus className="w-4 h-4" /> Tambah Promo
+        </button>
+      )}
+      {form && (
+        <Card>
+          <SectionLabel>{form.editingId ? 'Edit Promo' : 'Promo Baru'}</SectionLabel>
+          <div className="space-y-2.5">
+            <Field label="Nama Promo"><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Contoh: Promo 17-an, Beli 2 Gratis 1" className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Mulai"><input type="date" value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} /></Field>
+              <Field label="Selesai"><input type="date" value={form.endDate} onChange={(e) => setForm({ ...form, endDate: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} /></Field>
+            </div>
+            <Field label="Keterangan (opsional)"><input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+          </div>
+          <div className="flex gap-2 mt-3.5">
+            <button onClick={() => setForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+            <button onClick={submit} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+          </div>
+        </Card>
+      )}
+
+      {past.length > 0 && (
+        <div>
+          <SectionLabel>Sudah Selesai</SectionLabel>
+          <div className="space-y-2">{past.map((p) => <PromoCard key={p.id} p={p} status="past" />)}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- MARKETING TAB (wrapper: Afiliator | Promo) ---------------- */
+function MarketingTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, affiliatePayments, onSaveAffiliatePayments, promos, onSavePromos }) {
+  const [sub, setSub] = useState('afiliator');
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {[{ id: 'afiliator', label: 'Afiliator' }, { id: 'promo', label: 'Promo Berjalan' }].map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {sub === 'afiliator' ? (
+        <AffiliateTab affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={onSaveAffiliates} onSaveAffiliateSales={onSaveAffiliateSales} affiliatePayments={affiliatePayments} onSaveAffiliatePayments={onSaveAffiliatePayments} />
+      ) : (
+        <PromoTab promos={promos} onSavePromos={onSavePromos} />
+      )}
+    </div>
+  );
+}
+
+function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
   const [sub, setSub] = useState('gaji');
   return (
     <div className="space-y-4">
       <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
-        {[{ id: 'gaji', label: 'Target Gaji' }, { id: 'afiliator', label: 'Afiliator' }, { id: 'belanja', label: 'Belanja Bahan' }].map((t) => (
+        {[{ id: 'gaji', label: 'Target Penjualan' }, { id: 'belanja', label: 'Belanja Bahan' }].map((t) => (
           <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-xs font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
             {t.label}
           </button>
@@ -2110,11 +2509,8 @@ function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees,
       {sub === 'gaji' && (
         <TargetTab employees={employees} targetSettings={targetSettings} salesRecords={salesRecords} onSaveEmployees={onSaveEmployees} onSaveTargetSettings={onSaveTargetSettings} />
       )}
-      {sub === 'afiliator' && (
-        <AffiliateTab affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={onSaveAffiliates} onSaveAffiliateSales={onSaveAffiliateSales} />
-      )}
       {sub === 'belanja' && (
-        <PurchaseTab rawMaterials={rawMaterials} finishedStock={finishedStock} purchaseLog={purchaseLog} onSaveRaw={onSaveRaw} onSaveFinished={onSaveFinished} onSavePurchaseLog={onSavePurchaseLog} />
+        <PurchaseEntryTab rawMaterials={rawMaterials} finishedStock={finishedStock} purchaseLog={purchaseLog} onSaveRaw={onSaveRaw} onSaveFinished={onSaveFinished} onSavePurchaseLog={onSavePurchaseLog} />
       )}
     </div>
   );
