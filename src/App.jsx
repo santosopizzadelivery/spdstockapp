@@ -451,7 +451,7 @@ function MainApp({ uid, email }) {
   return (
     <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <Header saving={saving} email={email} />
-      <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 max-w-md w-full mx-auto">
+      <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 w-full">
         {activeTab === 'dashboard' && (
           <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} purchaseLog={purchaseLog} affiliateSales={affiliateSales} affiliatePayments={affiliatePayments} promos={promos} />
         )}
@@ -514,7 +514,7 @@ function MainApp({ uid, email }) {
           />
         )}
       </main>
-      <nav className="shrink-0 flex border-t max-w-md w-full mx-auto" style={{ borderColor: COLORS.border, background: COLORS.surface }}>
+      <nav className="shrink-0 flex border-t w-full" style={{ borderColor: COLORS.border, background: COLORS.surface }}>
         {TABS.map((t) => {
           const Icon = t.icon;
           const active = activeTab === t.id;
@@ -540,7 +540,7 @@ function MainApp({ uid, email }) {
 
 function Header({ saving, email }) {
   return (
-    <header className="shrink-0 px-4 py-3.5 flex items-center justify-between max-w-md w-full mx-auto" style={{ borderBottom: `1px solid ${COLORS.border}`, background: `linear-gradient(180deg, ${COLORS.surfaceLight}, ${COLORS.bg})` }}>
+    <header className="shrink-0 px-4 py-3.5 flex items-center justify-between w-full" style={{ borderBottom: `1px solid ${COLORS.border}`, background: `linear-gradient(180deg, ${COLORS.surfaceLight}, ${COLORS.bg})` }}>
       <div className="flex items-center gap-2.5 min-w-0">
         <img src="/logo.png" alt="SPD" className="w-9 h-9 rounded-full object-cover shrink-0" />
         <div className="min-w-0">
