@@ -8,6 +8,33 @@ import { auth, db } from './firebase';
 import { loadKey, saveKey } from './store';
 import { collection, onSnapshot, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 
+/* ======================================================================
+   BUSINESS_CONFIG — SATU-SATUNYA TEMPAT YANG PERLU DIEDIT TIAP KLIEN BARU
+   Ganti nilai-nilai di bawah sesuai bisnis klien. Tidak perlu ubah kode
+   lain di file ini. Untuk warna/logo, lihat COLORS di bawah + folder
+   public/ (logo.png, icon-192.png, icon-512.png, manifest.json — file
+   manifest.json TIDAK otomatis ikut config ini, edit manual terpisah
+   karena itu file statis yang dimuat sebelum JavaScript jalan).
+   ====================================================================== */
+const BUSINESS_CONFIG = {
+  appName: 'Stok & Rekap Harian',           // muncul di header & tab judul browser
+  businessName: 'Santoso Pizza Delivery',   // muncul di bawah nama app di header & login
+
+  // Kategori Menu Jadi. Bebas berapa pun jumlahnya, kategori pertama jadi default saat tambah menu baru.
+  // Contoh warung kelontong: ['Sembako', 'Minuman', 'Rokok', 'Lainnya']
+  categories: ['Pizza', 'Minuman', 'Pelengkap', 'Lainnya'],
+
+  // Kata kunci nama menu yang memicu munculnya dropdown "Referensi Afiliator" saat input Penjualan.
+  // Kosongkan jadi [] kalau bisnis ini tidak pakai program afiliator sama sekali.
+  affiliateEligibleKeywords: ['d18', 'd25'],
+  affiliateBaseCommission: 5000,   // komisi per box/unit
+  affiliateCombinedBonus: 3000,    // tambahan komisi kalau "dikirim sekaligus" (dicatat manual di Marketing)
+  affiliateWeekStartDay: 0,        // hari mulai siklus mingguan afiliator: 0=Minggu, 1=Senin, dst.
+
+  payrollCycleStartDay: 1,         // tanggal mulai siklus Target Penjualan/gajian (1-28)
+};
+const CATEGORIES = BUSINESS_CONFIG.categories;
+
 const COLORS = {
   bg: '#1C1410',
   surface: '#251C15',
@@ -39,7 +66,6 @@ const TABS = [
   { id: 'marketing', label: 'Marketing', icon: Megaphone },
   { id: 'riwayat', label: 'Riwayat', icon: History },
 ];
-const CATEGORIES = ['Pizza', 'Minuman', 'Pelengkap', 'Lainnya'];
 
 /* ---------------- HELPERS: resep, HPP, dua tingkat (raw & base) ---------------- */
 const ingSourceType = (ing) => ing.sourceType || 'raw';
@@ -123,12 +149,16 @@ function computeBaseProductionStats(baseId, productionLog) {
 /* ---------------- HELPERS: Target Bulanan (Laba Kotor) & Gaji ---------------- */
 function computeTargetStats(employees, bufferAmount, salesRecords) {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const dayOfMonth = now.getDate();
-  const monthPrefix = `${year}-${String(month + 1).padStart(2, '0')}`;
-  const monthRecords = salesRecords.filter((r) => r.date.startsWith(monthPrefix));
+  const startDay = Math.min(28, Math.max(1, BUSINESS_CONFIG.payrollCycleStartDay || 1));
+  let periodStart;
+  if (now.getDate() >= startDay) periodStart = new Date(now.getFullYear(), now.getMonth(), startDay);
+  else periodStart = new Date(now.getFullYear(), now.getMonth() - 1, startDay);
+  const periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, startDay - 1);
+  const daysInMonth = Math.round((periodEnd - periodStart) / 86400000) + 1;
+  const dayOfMonth = Math.round((now - periodStart) / 86400000) + 1;
+  const periodStartISO = periodStart.toISOString().slice(0, 10);
+  const periodEndISO = periodEnd.toISOString().slice(0, 10);
+  const monthRecords = salesRecords.filter((r) => r.date >= periodStartISO && r.date <= periodEndISO);
   const realisasi = monthRecords.reduce((s, r) => s + getMargin(r), 0);
   const totalGaji = employees.reduce((s, e) => s + (e.salary || 0), 0);
   const targetBulanan = totalGaji + (bufferAmount || 0);
@@ -139,13 +169,21 @@ function computeTargetStats(employees, bufferAmount, salesRecords) {
   const sisaHari = Math.max(1, daysInMonth - dayOfMonth + 1);
   const rataRataDibutuhkan = sisaTarget / sisaHari;
   const paceDiff = realisasi - expectedByToday;
-  return { daysInMonth, dayOfMonth, realisasi, totalGaji, targetBulanan, targetHarianRataRata, expectedByToday, progressPercent, sisaTarget, sisaHari, rataRataDibutuhkan, paceDiff };
+  return { daysInMonth, dayOfMonth, realisasi, totalGaji, targetBulanan, targetHarianRataRata, expectedByToday, progressPercent, sisaTarget, sisaHari, rataRataDibutuhkan, paceDiff, periodStartISO, periodEndISO };
+}
+function formatTargetPeriodLabel(t) {
+  if (BUSINESS_CONFIG.payrollCycleStartDay === 1) {
+    return new Date(t.periodStartISO + 'T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  }
+  const fmt = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' });
+  return `${fmt(t.periodStartISO)} – ${fmt(t.periodEndISO)}`;
 }
 
-/* ---------------- HELPERS: minggu Minggu-Sabtu (komisi afiliator) ---------------- */
+/* ---------------- HELPERS: minggu afiliator (hari mulai bisa diatur) ---------------- */
 function weekStartISO(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
-  d.setDate(d.getDate() - d.getDay()); // mundur ke hari Minggu
+  const diff = (d.getDay() - BUSINESS_CONFIG.affiliateWeekStartDay + 7) % 7;
+  d.setDate(d.getDate() - diff);
   return d.toISOString().slice(0, 10);
 }
 function weekRangeLabel(startISO) {
@@ -156,7 +194,7 @@ function weekRangeLabel(startISO) {
   return `${fmt(start)} – ${fmt(end)}`;
 }
 function computeAffiliateCommission(boxQty, combined) {
-  return (boxQty || 0) * (5000 + (combined ? 3000 : 0));
+  return (boxQty || 0) * (BUSINESS_CONFIG.affiliateBaseCommission + (combined ? BUSINESS_CONFIG.affiliateCombinedBonus : 0));
 }
 function isPromoActive(promo, dateStr = todayISO()) {
   return dateStr >= promo.startDate && dateStr <= promo.endDate;
@@ -199,6 +237,10 @@ export default function App() {
   const [user, setUser] = useState(null);
 
   useEffect(() => {
+    document.title = BUSINESS_CONFIG.appName;
+  }, []);
+
+  useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setAuthLoading(false);
@@ -239,9 +281,9 @@ function LoginScreen() {
     <div className="h-screen flex items-center justify-center px-6 font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
       <form onSubmit={submit} className="w-full max-w-xs space-y-4">
         <div className="flex flex-col items-center gap-2 mb-2">
-          <img src="/logo.png" alt="SPD" className="w-20 h-20 rounded-full object-cover" />
-          <h1 className="font-display text-lg font-semibold">Stok & Rekap Harian</h1>
-          <p className="text-xs" style={{ color: COLORS.textMuted }}>Santoso Pizza Delivery</p>
+          <img src="/logo.png" alt={BUSINESS_CONFIG.businessName} className="w-20 h-20 rounded-full object-cover" />
+          <h1 className="font-display text-lg font-semibold">{BUSINESS_CONFIG.appName}</h1>
+          <p className="text-xs" style={{ color: COLORS.textMuted }}>{BUSINESS_CONFIG.businessName}</p>
         </div>
         <div className="rounded-lg px-3 py-2 border" style={{ borderColor: COLORS.border, background: COLORS.surface }}>
           <label className="text-[10px] block" style={{ color: COLORS.textMuted }}>Email</label>
@@ -542,9 +584,9 @@ function Header({ saving, email }) {
   return (
     <header className="shrink-0 px-4 py-3.5 flex items-center justify-between w-full" style={{ borderBottom: `1px solid ${COLORS.border}`, background: `linear-gradient(180deg, ${COLORS.surfaceLight}, ${COLORS.bg})` }}>
       <div className="flex items-center gap-2.5 min-w-0">
-        <img src="/logo.png" alt="SPD" className="w-9 h-9 rounded-full object-cover shrink-0" />
+        <img src="/logo.png" alt={BUSINESS_CONFIG.businessName} className="w-9 h-9 rounded-full object-cover shrink-0" />
         <div className="min-w-0">
-          <h1 className="font-display text-base font-semibold leading-tight truncate" style={{ color: COLORS.text }}>Stok & Rekap Harian</h1>
+          <h1 className="font-display text-base font-semibold leading-tight truncate" style={{ color: COLORS.text }}>{BUSINESS_CONFIG.appName}</h1>
           <p className="text-[11px] leading-tight truncate" style={{ color: COLORS.textMuted }}>{email}</p>
         </div>
       </div>
@@ -832,7 +874,7 @@ function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, emplo
   const lastWeekUnpaid = lastWeekCommission > 0 && !affiliatePayments.includes(lastCompletedWeekStart);
 
   const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
-  const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  const monthLabel = formatTargetPeriodLabel(t);
 
   const lowRaw = rawMaterials.filter((m) => (m.minStock > 0 && m.currentStock <= m.minStock) || m.currentStock <= 0);
   const lowBase = baseStock.filter((m) => (m.minStock > 0 && m.currentStock <= m.minStock) || m.currentStock <= 0);
@@ -1062,7 +1104,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
   const openNew = () => {
     if (sub === 'bahan') setForm({ editingId: null, name: '', unit: 'kg', currentStock: '', minStock: '', purchasePrice: '' });
     else if (sub === 'base') setForm({ editingId: null, name: '', unit: 'pcs', currentStock: '', minStock: '', yieldQty: '1', recipe: [] });
-    else setForm({ editingId: null, name: '', unit: 'pcs', category: 'Pizza', sellingPrice: '', recipeBased: false, recipe: [], currentStock: '', minStock: '', purchasePrice: '' });
+    else setForm({ editingId: null, name: '', unit: 'pcs', category: CATEGORIES[0] || 'Lainnya', sellingPrice: '', recipeBased: false, recipe: [], currentStock: '', minStock: '', purchasePrice: '' });
   };
 
   const openEdit = (item) => {
@@ -1426,7 +1468,7 @@ function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, product
           <SectionLabel>{form.editingId ? 'Edit Item' : 'Item Baru'}</SectionLabel>
           <div className="space-y-2.5">
             <Field label="Nama">
-              <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder={sub === 'bahan' ? 'Contoh: Tepung Terigu' : sub === 'base' ? 'Contoh: Base Pizza' : 'Contoh: Chicken Sausage Party'} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder={sub === 'bahan' ? 'Contoh: Nama Bahan' : sub === 'base' ? 'Contoh: Adonan Dasar' : 'Contoh: Nama Menu/Produk'} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
             </Field>
 
             {sub === 'pizza' && (
@@ -1611,7 +1653,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
   const [items, setItems] = useState([{ id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
   const [notes, setNotes] = useState('');
 
-  const isAffiliateEligible = (name) => /d18|d25/i.test(name || '');
+  const isAffiliateEligible = (name) => BUSINESS_CONFIG.affiliateEligibleKeywords.some((kw) => (name || '').toLowerCase().includes(kw.toLowerCase()));
 
   useEffect(() => {
     if (!channel && channels.length > 0) setChannel(channels[0].name);
@@ -1785,7 +1827,7 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
             return (
               <div key={item.id} className="rounded-xl p-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
                 <div className="flex items-center gap-2 mb-2">
-                  <input value={item.name} onChange={(e) => updateItem(item.id, 'name', e.target.value)} list="pizza-names" placeholder="Nama item (pizza / minuman / lainnya)" className="flex-1 bg-transparent outline-none text-sm min-w-0" style={{ color: COLORS.text }} />
+                  <input value={item.name} onChange={(e) => updateItem(item.id, 'name', e.target.value)} list="menu-jadi-names" placeholder="Nama item yang terjual" className="flex-1 bg-transparent outline-none text-sm min-w-0" style={{ color: COLORS.text }} />
                   <button onClick={() => removeRow(item.id)} style={{ color: COLORS.textMuted }}><X className="w-4 h-4" /></button>
                 </div>
                 <div className="grid grid-cols-3 gap-2 items-end">
@@ -1802,14 +1844,14 @@ function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, ch
                         {affiliates.map((a) => <option key={a.id} value={a.id} style={{ background: COLORS.surface }}>{a.name}</option>)}
                       </select>
                     </Field>
-                    {item.affiliateId && <p className="text-[10px] mt-1" style={{ color: COLORS.secondary }}>Komisi Rp{(5000 * (parseFloat(item.qty) || 0)).toLocaleString('id-ID')} otomatis tercatat ke afiliator ini saat disimpan.</p>}
+                    {item.affiliateId && <p className="text-[10px] mt-1" style={{ color: COLORS.secondary }}>Komisi {rupiah(BUSINESS_CONFIG.affiliateBaseCommission * (parseFloat(item.qty) || 0))} otomatis tercatat ke afiliator ini saat disimpan.</p>}
                   </div>
                 )}
               </div>
             );
           })}
         </div>
-        <datalist id="pizza-names">{finishedStock.map((f) => <option key={f.id} value={f.name} />)}</datalist>
+        <datalist id="menu-jadi-names">{finishedStock.map((f) => <option key={f.id} value={f.name} />)}</datalist>
         <button onClick={addRow} className="w-full mt-2 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}><Plus className="w-4 h-4" /> Tambah Item</button>
       </div>
 
@@ -2089,13 +2131,13 @@ function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffi
               <Field label="Jumlah Box"><input type="number" value={entry.boxQty} onChange={(e) => setEntry({ ...entry, boxQty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
             </div>
             <button type="button" onClick={() => setEntry({ ...entry, combined: !entry.combined })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: entry.combined ? 'rgba(122,154,87,0.12)' : COLORS.bg }}>
-              <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><Truck className="w-4 h-4" /> Dikirim sekaligus (+Rp3.000/box)</span>
+              <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><Truck className="w-4 h-4" /> Dikirim sekaligus (+{rupiah(BUSINESS_CONFIG.affiliateCombinedBonus)}/box)</span>
               <span className="w-9 h-5 rounded-full relative transition-colors" style={{ background: entry.combined ? COLORS.secondary : COLORS.border }}>
                 <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: entry.combined ? '18px' : '2px' }} />
               </span>
             </button>
             <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
-              <span style={{ color: COLORS.textMuted }}>Rp{entry.combined ? '8.000' : '5.000'}/box</span>
+              <span style={{ color: COLORS.textMuted }}>{rupiah(BUSINESS_CONFIG.affiliateBaseCommission + (entry.combined ? BUSINESS_CONFIG.affiliateCombinedBonus : 0))}/box</span>
               <span style={{ color: COLORS.secondary }}>Komisi: {rupiah(previewCommission)}</span>
             </div>
           </div>
@@ -2522,7 +2564,7 @@ function TargetTab({ employees, targetSettings, salesRecords, onSaveEmployees, o
   const [bufferInput, setBufferInput] = useState(String(targetSettings.bufferAmount || ''));
 
   const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
-  const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  const monthLabel = formatTargetPeriodLabel(t);
 
   const openNewEmp = () => setEmpForm({ editingId: null, name: '', salary: '' });
   const openEditEmp = (e) => setEmpForm({ editingId: e.id, name: e.name, salary: String(e.salary) });
