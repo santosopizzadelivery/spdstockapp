@@ -1,9 +1,14 @@
 import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { db } from './firebase';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { db, storage } from './firebase';
 
-// Setiap key disimpan sebagai satu dokumen di: users/{uid}/appdata/{key}
-// Struktur ini sengaja dipisah per-uid supaya Firestore Security Rules bisa
-// membatasi: seorang user cuma bisa baca/tulis dokumen di bawah uid-nya sendiri.
+export async function uploadProductImage(uid, itemId, file) {
+  const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+  const path = `products/${uid}/${itemId}-${Date.now()}.${ext}`;
+  const storageRef = ref(storage, path);
+  await uploadBytes(storageRef, file);
+  return await getDownloadURL(storageRef);
+}
 
 export async function loadKey(uid, key, fallback) {
   try {

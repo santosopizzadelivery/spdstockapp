@@ -2,10 +2,10 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
-  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown, Megaphone, Percent, Bell, Trophy, RotateCcw, BadgeCheck
+  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown, Megaphone, Percent, Bell, Trophy, RotateCcw, BadgeCheck, ImagePlus, Eye, EyeOff, ShoppingBag
 } from 'lucide-react';
 import { auth, db } from './firebase';
-import { loadKey, saveKey } from './store';
+import { loadKey, saveKey, uploadProductImage } from './store';
 import { collection, onSnapshot, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 
 /* ======================================================================
@@ -60,6 +60,7 @@ const getMargin = (r) => (typeof r.margin === 'number' ? r.margin : r.total);
 const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'stok', label: 'Stok', icon: Package },
+  { id: 'etalase', label: 'Etalase', icon: ShoppingBag },
   { id: 'penjualan', label: 'Penjualan', icon: Receipt },
   { id: 'returan', label: 'Returan', icon: RotateCcw },
   { id: 'keuangan', label: 'Keuangan', icon: Wallet },
@@ -503,6 +504,9 @@ function MainApp({ uid, email }) {
             onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveProductionLog={saveProductionLog} onSaveWasteLog={saveWasteLog}
           />
         )}
+        {activeTab === 'etalase' && (
+          <EtalaseTab uid={uid} finishedStock={finishedStock} onSaveFinished={saveFinished} />
+        )}
         {activeTab === 'penjualan' && (
           <PenjualanTab
             rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} channels={channels}
@@ -772,6 +776,139 @@ function ReturanTab({ rawMaterials, baseStock, finishedStock, wasteLog, onSaveRa
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ---------------- ETALASE TAB (kelola tampilan produk untuk Checkout publik) ---------------- */
+function EtalaseTab({ uid, finishedStock, onSaveFinished }) {
+  const [categoryFilter, setCategoryFilter] = useState('Semua');
+  const [editItem, setEditItem] = useState(null); // { id, name, sellingPrice, description, imageUrl, category, showInEtalase }
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+
+  const displayed = categoryFilter === 'Semua' ? finishedStock : finishedStock.filter((f) => (f.category || 'Lainnya') === categoryFilter);
+  const shownCount = finishedStock.filter((f) => f.showInEtalase).length;
+
+  const openEdit = (item) => setEditItem({
+    id: item.id, name: item.name, sellingPrice: String(item.sellingPrice || ''),
+    description: item.description || '', imageUrl: item.imageUrl || '', category: item.category || CATEGORIES[0] || 'Lainnya',
+    showInEtalase: !!item.showInEtalase,
+  });
+
+  const save = () => {
+    if (!editItem.name.trim()) return;
+    onSaveFinished(finishedStock.map((f) => (f.id === editItem.id ? {
+      ...f, name: editItem.name.trim(), sellingPrice: parseFloat(editItem.sellingPrice) || 0,
+      description: editItem.description.trim(), imageUrl: editItem.imageUrl, category: editItem.category, showInEtalase: editItem.showInEtalase,
+    } : f)));
+    setEditItem(null);
+  };
+
+  const toggleShow = (item) => onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, showInEtalase: !f.showInEtalase } : f)));
+
+  const handleFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file || !editItem) return;
+    setUploadError('');
+    setUploading(true);
+    try {
+      const url = await uploadProductImage(uid, editItem.id, file);
+      setEditItem({ ...editItem, imageUrl: url });
+    } catch (err) {
+      console.error(err);
+      setUploadError('Gagal upload gambar. Cek koneksi atau coba file lain.');
+    }
+    setUploading(false);
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <div className="flex items-center justify-between">
+          <span className="text-sm flex items-center gap-1.5" style={{ color: COLORS.textMuted }}><ShoppingBag className="w-3.5 h-3.5" /> Tampil di Etalase</span>
+          <span className="font-display text-base font-semibold" style={{ color: COLORS.text }}>{shownCount} dari {finishedStock.length} produk</span>
+        </div>
+        <p className="text-[10px] mt-1.5" style={{ color: COLORS.textMuted }}>Cuma produk yang di-toggle "Tampil" di bawah yang muncul di halaman Checkout publik.</p>
+      </Card>
+
+      <div className="flex gap-1.5 overflow-x-auto pb-0.5">
+        {['Semua', ...CATEGORIES].map((c) => (
+          <button key={c} onClick={() => setCategoryFilter(c)} className="px-3 py-1.5 rounded-full text-xs font-medium shrink-0" style={categoryFilter === c ? { background: COLORS.secondary, color: COLORS.bg } : { background: COLORS.surface, color: COLORS.textMuted, border: `1px solid ${COLORS.border}` }}>
+            {c}
+          </button>
+        ))}
+      </div>
+
+      {displayed.length === 0 ? (
+        <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada produk di kategori ini. Tambahkan dulu lewat tab Stok &gt; Menu Jadi.</p></Card>
+      ) : (
+        <div className="space-y-2">
+          {displayed.map((item) => (
+            <div key={item.id} className="rounded-xl overflow-hidden flex items-center gap-3 px-3 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <div className="w-14 h-14 rounded-lg overflow-hidden shrink-0 flex items-center justify-center" style={{ background: COLORS.surfaceLight }}>
+                {item.imageUrl ? <img src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" /> : <ImagePlus className="w-5 h-5" style={{ color: COLORS.textMuted }} />}
+              </div>
+              <div className="flex-1 min-w-0" onClick={() => openEdit(item)}>
+                <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{item.name}</p>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{rupiah(item.sellingPrice)} · {item.category || 'Lainnya'}</p>
+                {!item.description && <p className="text-[10px] italic" style={{ color: COLORS.warning }}>Belum ada deskripsi</p>}
+              </div>
+              <div className="flex flex-col items-center gap-1.5 shrink-0">
+                <button onClick={() => toggleShow(item)} className="p-1.5 rounded-md" style={{ color: item.showInEtalase ? COLORS.secondary : COLORS.textMuted }}>
+                  {item.showInEtalase ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                </button>
+                <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editItem && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={() => setEditItem(null)}>
+          <div className="w-full max-h-[85vh] overflow-y-auto rounded-t-2xl sm:rounded-2xl sm:max-w-md p-4" style={{ background: COLORS.surface }} onClick={(e) => e.stopPropagation()}>
+            <SectionLabel>Edit Produk di Etalase</SectionLabel>
+            <div className="space-y-2.5">
+              <div className="flex items-center gap-3">
+                <div className="w-20 h-20 rounded-xl overflow-hidden shrink-0 flex items-center justify-center" style={{ background: COLORS.surfaceLight }}>
+                  {uploading ? <Loader2 className="w-5 h-5 animate-spin" style={{ color: COLORS.textMuted }} /> : editItem.imageUrl ? <img src={editItem.imageUrl} alt="" className="w-full h-full object-cover" /> : <ImagePlus className="w-6 h-6" style={{ color: COLORS.textMuted }} />}
+                </div>
+                <label className="flex-1 text-center py-2.5 rounded-lg text-xs font-medium cursor-pointer" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+                  {editItem.imageUrl ? 'Ganti Foto' : 'Upload Foto'}
+                  <input type="file" accept="image/*" className="hidden" onChange={handleFile} disabled={uploading} />
+                </label>
+              </div>
+              {uploadError && <p className="text-[11px]" style={{ color: COLORS.primaryLight }}>{uploadError}</p>}
+
+              <Field label="Nama Produk">
+                <input value={editItem.name} onChange={(e) => setEditItem({ ...editItem, name: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+              <Field label="Kategori">
+                <select value={editItem.category} onChange={(e) => setEditItem({ ...editItem, category: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                  {CATEGORIES.map((c) => <option key={c} value={c} style={{ background: COLORS.surface }}>{c}</option>)}
+                </select>
+              </Field>
+              <Field label="Harga Jual">
+                <input type="number" value={editItem.sellingPrice} onChange={(e) => setEditItem({ ...editItem, sellingPrice: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+              <Field label="Deskripsi">
+                <textarea value={editItem.description} onChange={(e) => setEditItem({ ...editItem, description: e.target.value })} rows={3} placeholder="Ceritakan produk ini ke pelanggan..." className="w-full bg-transparent outline-none text-sm py-2 resize-none" style={{ color: COLORS.text }} />
+              </Field>
+              <button type="button" onClick={() => setEditItem({ ...editItem, showInEtalase: !editItem.showInEtalase })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: editItem.showInEtalase ? 'rgba(122,154,87,0.12)' : COLORS.bg }}>
+                <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}>{editItem.showInEtalase ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />} Tampil di Etalase publik</span>
+                <span className="w-9 h-5 rounded-full relative transition-colors" style={{ background: editItem.showInEtalase ? COLORS.secondary : COLORS.border }}>
+                  <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: editItem.showInEtalase ? '18px' : '2px' }} />
+                </span>
+              </button>
+            </div>
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => setEditItem(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={save} disabled={uploading} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
