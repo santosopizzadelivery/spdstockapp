@@ -1,0 +1,3176 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { BrowserRouter, Routes, Route, useParams, useNavigate } from 'react-router-dom';
+import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
+import {
+  Home, Package, Receipt, History, Plus, Minus, X, Pencil, Trash2,
+  AlertTriangle, Flame, TrendingUp, Save, Check, Calendar, Loader2, LogOut, Lock, ChefHat, Layers, Factory, ChevronUp, ChevronDown, LayoutDashboard, Target as TargetIcon, Users, Gauge, Wallet, Store, UserCheck, Truck, PackageX, Undo2, ClipboardList, Download, TrendingDown, ArrowUp, ArrowDown, Megaphone, Percent, Bell, Trophy, RotateCcw, BadgeCheck, ImagePlus, Eye, EyeOff, ShoppingBag
+} from 'lucide-react';
+import { auth, db } from './firebase';
+import { loadKey, saveKey, uploadProductImage } from './store';
+import { collection, onSnapshot, doc, updateDoc, serverTimestamp, setDoc, deleteDoc, getDoc, getDocs, addDoc } from 'firebase/firestore';
+
+/* ======================================================================
+   BUSINESS_CONFIG — SATU-SATUNYA TEMPAT YANG PERLU DIEDIT TIAP KLIEN BARU
+   Ganti nilai-nilai di bawah sesuai bisnis klien. Tidak perlu ubah kode
+   lain di file ini. Untuk warna/logo, lihat COLORS di bawah + folder
+   public/ (logo.png, icon-192.png, icon-512.png, manifest.json — file
+   manifest.json TIDAK otomatis ikut config ini, edit manual terpisah
+   karena itu file statis yang dimuat sebelum JavaScript jalan).
+   ====================================================================== */
+const BUSINESS_CONFIG = {
+  appName: 'Stok & Rekap Harian',           // muncul di header & tab judul browser
+  businessName: 'Santoso Pizza Delivery',   // muncul di bawah nama app di header & login
+
+  // Kategori Menu Jadi. Bebas berapa pun jumlahnya, kategori pertama jadi default saat tambah menu baru.
+  // Contoh warung kelontong: ['Sembako', 'Minuman', 'Rokok', 'Lainnya']
+  categories: ['Pizza', 'Minuman', 'Pelengkap', 'Lainnya'],
+
+  // Kata kunci nama menu yang memicu munculnya dropdown "Referensi Afiliator" saat input Penjualan.
+  // Kosongkan jadi [] kalau bisnis ini tidak pakai program afiliator sama sekali.
+  affiliateEligibleKeywords: ['d18', 'd25'],
+  affiliateBaseCommission: 5000,   // komisi per box/unit
+  affiliateCombinedBonus: 3000,    // tambahan komisi kalau "dikirim sekaligus" (dicatat manual di Marketing)
+  affiliateWeekStartDay: 0,        // hari mulai siklus mingguan afiliator: 0=Minggu, 1=Senin, dst.
+
+  payrollCycleStartDay: 1,         // tanggal mulai siklus Target Penjualan/gajian (1-28)
+
+  // WAJIB diisi untuk halaman publik (Etalase/Checkout/Tracking) supaya tahu data toko siapa
+  // yang mau ditampilkan — ambil dari Firebase Console -> Authentication -> Users -> User UID
+  // (akun Owner yang sudah kamu buat manual). Sama seperti OWNER_UID di index.html versi lama.
+  ownerUid: 'GANTI_DENGAN_UID_OWNER',
+  paymentMethods: ['Tunai (COD)', 'Transfer Bank', 'QRIS'],
+};
+const CATEGORIES = BUSINESS_CONFIG.categories;
+
+const COLORS = {
+  bg: '#1C1410',
+  surface: '#251C15',
+  surfaceLight: '#2F251C',
+  border: '#3D3025',
+  primary: '#C1391F',
+  primaryLight: '#E0532F',
+  secondary: '#7A9A57',
+  warning: '#D9A441',
+  text: '#F2E9DC',
+  textMuted: '#A8998A',
+};
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const genId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const rupiah = (n) => `Rp${Math.round(n || 0).toLocaleString('id-ID')}`;
+const fmtDate = (iso) => {
+  const d = new Date(iso + 'T00:00:00');
+  return d.toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+};
+const getMargin = (r) => (typeof r.margin === 'number' ? r.margin : r.total);
+
+const TABS = [
+  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { id: 'stok', label: 'Stok', icon: Package },
+  { id: 'etalase', label: 'Etalase', icon: ShoppingBag },
+  { id: 'penjualan', label: 'Penjualan', icon: Receipt },
+  { id: 'returan', label: 'Returan', icon: RotateCcw },
+  { id: 'keuangan', label: 'Keuangan', icon: Wallet },
+  { id: 'marketing', label: 'Marketing', icon: Megaphone },
+  { id: 'riwayat', label: 'Riwayat', icon: History },
+];
+
+/* ---------------- HELPERS: resep, HPP, dua tingkat (raw & base) ---------------- */
+const ingSourceType = (ing) => ing.sourceType || 'raw';
+const ingSourceId = (ing) => ing.sourceId || ing.rawMaterialId;
+
+function computeBaseUnitCost(base, rawMaterials) {
+  const batchCost = (base.recipe || []).reduce((sum, ing) => {
+    const rm = rawMaterials.find((r) => r.id === ingSourceId(ing));
+    return sum + (ing.qty || 0) * (rm ? rm.purchasePrice || 0 : 0);
+  }, 0);
+  const yieldQty = base.yieldQty || 1;
+  return yieldQty > 0 ? batchCost / yieldQty : 0;
+}
+
+function computeRecipeHpp(recipe, rawMaterials, baseStock) {
+  return (recipe || []).reduce((sum, ing) => {
+    const type = ingSourceType(ing);
+    const id = ingSourceId(ing);
+    if (type === 'base') {
+      const b = (baseStock || []).find((x) => x.id === id);
+      return sum + (ing.qty || 0) * (b ? computeBaseUnitCost(b, rawMaterials) : 0);
+    }
+    const rm = rawMaterials.find((r) => r.id === id);
+    return sum + (ing.qty || 0) * (rm ? rm.purchasePrice || 0 : 0);
+  }, 0);
+}
+
+function computeMakeablePortions(recipe, rawMaterials, baseStock) {
+  if (!recipe || recipe.length === 0) return 0;
+  let min = Infinity;
+  for (const ing of recipe) {
+    const qty = ing.qty || 0;
+    if (qty <= 0) continue;
+    const type = ingSourceType(ing);
+    const id = ingSourceId(ing);
+    let available;
+    if (type === 'base') {
+      const b = (baseStock || []).find((x) => x.id === id);
+      available = b ? b.currentStock : 0;
+    } else {
+      const rm = rawMaterials.find((r) => r.id === id);
+      available = rm ? rm.currentStock : 0;
+    }
+    const possible = Math.floor(available / qty);
+    if (possible < min) min = possible;
+  }
+  return min === Infinity ? 0 : min;
+}
+function isMenuLow(item, rawMaterials, baseStock) {
+  if (item.recipeBased) {
+    const makeable = computeMakeablePortions(item.recipe, rawMaterials, baseStock);
+    return (item.minStock > 0 && makeable <= item.minStock) || makeable <= 0;
+  }
+  return (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
+}
+function menuHpp(item, rawMaterials, baseStock) {
+  return item.recipeBased ? computeRecipeHpp(item.recipe, rawMaterials, baseStock) : item.purchasePrice || 0;
+}
+
+/* ---------------- HELPERS: terjual bulanan & statistik produksi Base ---------------- */
+function computeMonthlySold(itemName, salesRecords) {
+  const now = new Date();
+  const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const key = itemName.trim().toLowerCase();
+  return salesRecords
+    .filter((r) => r.date.startsWith(monthPrefix))
+    .reduce((sum, r) => sum + r.items.filter((i) => i.name.trim().toLowerCase() === key).reduce((s, i) => s + i.qty, 0), 0);
+}
+function computeBaseProductionStats(baseId, productionLog) {
+  const entries = productionLog.filter((e) => e.baseId === baseId);
+  if (entries.length === 0) return { thisMonth: 0, avgPerMonth: 0 };
+  const now = new Date();
+  const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const thisMonth = entries.filter((e) => e.date.startsWith(monthPrefix)).reduce((s, e) => s + e.unitsProduced, 0);
+  const totalAllTime = entries.reduce((s, e) => s + e.unitsProduced, 0);
+  const firstDate = new Date(entries.map((e) => e.date).sort()[0] + 'T00:00:00');
+  const monthsSpan = (now.getFullYear() - firstDate.getFullYear()) * 12 + (now.getMonth() - firstDate.getMonth()) + 1;
+  return { thisMonth, avgPerMonth: totalAllTime / Math.max(1, monthsSpan) };
+}
+
+/* ---------------- HELPERS: Target Bulanan (Laba Kotor) & Gaji ---------------- */
+function computeTargetStats(employees, bufferAmount, salesRecords) {
+  const now = new Date();
+  const startDay = Math.min(28, Math.max(1, BUSINESS_CONFIG.payrollCycleStartDay || 1));
+  let periodStart;
+  if (now.getDate() >= startDay) periodStart = new Date(now.getFullYear(), now.getMonth(), startDay);
+  else periodStart = new Date(now.getFullYear(), now.getMonth() - 1, startDay);
+  const periodEnd = new Date(periodStart.getFullYear(), periodStart.getMonth() + 1, startDay - 1);
+  const daysInMonth = Math.round((periodEnd - periodStart) / 86400000) + 1;
+  const dayOfMonth = Math.round((now - periodStart) / 86400000) + 1;
+  const periodStartISO = periodStart.toISOString().slice(0, 10);
+  const periodEndISO = periodEnd.toISOString().slice(0, 10);
+  const monthRecords = salesRecords.filter((r) => r.date >= periodStartISO && r.date <= periodEndISO);
+  const realisasi = monthRecords.reduce((s, r) => s + getMargin(r), 0);
+  const totalGaji = employees.reduce((s, e) => s + (e.salary || 0), 0);
+  const targetBulanan = totalGaji + (bufferAmount || 0);
+  const targetHarianRataRata = daysInMonth > 0 ? targetBulanan / daysInMonth : 0;
+  const expectedByToday = targetHarianRataRata * dayOfMonth;
+  const progressPercent = targetBulanan > 0 ? (realisasi / targetBulanan) * 100 : 0;
+  const sisaTarget = Math.max(0, targetBulanan - realisasi);
+  const sisaHari = Math.max(1, daysInMonth - dayOfMonth + 1);
+  const rataRataDibutuhkan = sisaTarget / sisaHari;
+  const paceDiff = realisasi - expectedByToday;
+  return { daysInMonth, dayOfMonth, realisasi, totalGaji, targetBulanan, targetHarianRataRata, expectedByToday, progressPercent, sisaTarget, sisaHari, rataRataDibutuhkan, paceDiff, periodStartISO, periodEndISO };
+}
+function formatTargetPeriodLabel(t) {
+  if (BUSINESS_CONFIG.payrollCycleStartDay === 1) {
+    return new Date(t.periodStartISO + 'T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  }
+  const fmt = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' });
+  return `${fmt(t.periodStartISO)} – ${fmt(t.periodEndISO)}`;
+}
+
+/* ---------------- HELPERS: minggu afiliator (hari mulai bisa diatur) ---------------- */
+function weekStartISO(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const diff = (d.getDay() - BUSINESS_CONFIG.affiliateWeekStartDay + 7) % 7;
+  d.setDate(d.getDate() - diff);
+  return d.toISOString().slice(0, 10);
+}
+function weekRangeLabel(startISO) {
+  const start = new Date(startISO + 'T00:00:00');
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  const fmt = (d) => d.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' });
+  return `${fmt(start)} – ${fmt(end)}`;
+}
+function computeAffiliateCommission(boxQty, combined) {
+  return (boxQty || 0) * (BUSINESS_CONFIG.affiliateBaseCommission + (combined ? BUSINESS_CONFIG.affiliateCombinedBonus : 0));
+}
+function isPromoActive(promo, dateStr = todayISO()) {
+  return dateStr >= promo.startDate && dateStr <= promo.endDate;
+}
+
+// deltaQty positif = KURANGI stok bahan (dipakai/hilang), negatif = TAMBAH stok bahan (retur bagus/dikembalikan)
+function applyRecipeDeltaGlobal(recipe, deltaQty, rawMaterials, baseStock, onSaveRaw, onSaveBase) {
+  const rawDelta = {};
+  const baseDelta = {};
+  (recipe || []).forEach((ing) => {
+    const type = ingSourceType(ing);
+    const id = ingSourceId(ing);
+    const amount = ing.qty * deltaQty;
+    if (type === 'base') baseDelta[id] = (baseDelta[id] || 0) + amount;
+    else rawDelta[id] = (rawDelta[id] || 0) + amount;
+  });
+  if (Object.keys(rawDelta).length > 0) onSaveRaw(rawMaterials.map((rm) => (rawDelta[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDelta[rm.id]) } : rm)));
+  if (Object.keys(baseDelta).length > 0) onSaveBase(baseStock.map((b) => (baseDelta[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDelta[b.id]) } : b)));
+}
+
+/* ---------------- HELPERS: Kerugian, Retur, Opname, Export ---------------- */
+const WASTE_REASONS = { rusak: 'Rusak', kadaluarsa: 'Kadaluarsa', 'gagal-produksi': 'Gagal Produksi', lainnya: 'Lainnya', 'retur-rusak': 'Retur (Rusak)', 'retur-bagus': 'Retur (Masih Bagus)', opname: 'Penyesuaian Opname' };
+
+function downloadCSV(filename, rows) {
+  const csv = rows.map((r) => r.map((cell) => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/* ---------------- ROOT: ROUTING ---------------- */
+export default function App() {
+  useEffect(() => {
+    document.title = BUSINESS_CONFIG.appName;
+  }, []);
+
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/toko" element={<PublicStorefront />} />
+        <Route path="/pesanan/:orderId" element={<OrderTrackingPage />} />
+        <Route path="*" element={<OwnerApp />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+/* ---------------- PUBLIK: ETALASE + CHECKOUT (tanpa login) ---------------- */
+function PublicStorefront() {
+  const uid = BUSINESS_CONFIG.ownerUid;
+  const navigate = useNavigate();
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [categoryFilter, setCategoryFilter] = useState('Semua');
+  const [cart, setCart] = useState({}); // { productId: qty }
+  const [showCheckout, setShowCheckout] = useState(false);
+  const [form, setForm] = useState({ customerName: '', customerPhone: '', customerAddress: '', deliveryTime: '', paymentMethod: BUSINESS_CONFIG.paymentMethods[0] || '', notes: '' });
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+
+  useEffect(() => {
+    if (!uid || uid === 'GANTI_DENGAN_UID_OWNER') { setLoading(false); return; }
+    const unsub = onSnapshot(collection(db, 'users', uid, 'public_products'), (snap) => {
+      setProducts(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      setLoading(false);
+    }, () => setLoading(false));
+    return () => unsub();
+  }, [uid]);
+
+  const cats = ['Semua', ...Array.from(new Set(products.map((p) => p.category || 'Lainnya')))];
+  const displayed = categoryFilter === 'Semua' ? products : products.filter((p) => (p.category || 'Lainnya') === categoryFilter);
+
+  const addToCart = (id) => setCart({ ...cart, [id]: (cart[id] || 0) + 1 });
+  const removeFromCart = (id) => setCart({ ...cart, [id]: Math.max(0, (cart[id] || 0) - 1) });
+  const cartItems = Object.entries(cart).filter(([, qty]) => qty > 0).map(([id, qty]) => ({ product: products.find((p) => p.id === id), qty })).filter((c) => c.product);
+  const cartTotal = cartItems.reduce((s, c) => s + c.product.sellingPrice * c.qty, 0);
+  const cartCount = cartItems.reduce((s, c) => s + c.qty, 0);
+
+  const submitOrder = async () => {
+    if (!form.customerName.trim() || !form.customerPhone.trim() || !form.customerAddress.trim() || cartItems.length === 0) return;
+    setSubmitting(true);
+    setSubmitError('');
+    try {
+      const orderRef = await addDoc(collection(db, 'users', uid, 'incoming_orders'), {
+        customerName: form.customerName.trim(),
+        customerPhone: form.customerPhone.trim(),
+        customerAddress: form.customerAddress.trim(),
+        deliveryTime: form.deliveryTime.trim(),
+        paymentMethod: form.paymentMethod,
+        notes: form.notes.trim(),
+        items: cartItems.map((c) => ({ name: c.product.name, qty: c.qty, price: c.product.sellingPrice })),
+        total: cartTotal,
+        status: 'pending',
+        createdAt: serverTimestamp(),
+      });
+      navigate(`/pesanan/${orderRef.id}`);
+    } catch (e) {
+      console.error(e);
+      setSubmitError('Gagal mengirim pesanan. Cek koneksi internet dan coba lagi.');
+    }
+    setSubmitting(false);
+  };
+
+  if (!uid || uid === 'GANTI_DENGAN_UID_OWNER') {
+    return (
+      <div className="h-screen flex items-center justify-center px-6 text-center font-sans" style={{ background: COLORS.bg, color: COLORS.textMuted }}>
+        Etalase belum diatur oleh pemilik toko.
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen font-sans pb-24" style={{ background: COLORS.bg, color: COLORS.text }}>
+      <header className="px-4 py-4 flex items-center gap-3" style={{ borderBottom: `1px solid ${COLORS.border}`, background: `linear-gradient(180deg, ${COLORS.surfaceLight}, ${COLORS.bg})` }}>
+        <img src="/logo.png" alt={BUSINESS_CONFIG.businessName} className="w-10 h-10 rounded-full object-cover" />
+        <div className="min-w-0">
+          <h1 className="font-display text-base font-semibold truncate">{BUSINESS_CONFIG.businessName}</h1>
+          <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Pesan langsung dari sini</p>
+        </div>
+      </header>
+
+      <div className="px-4 pt-4">
+        <div className="flex gap-1.5 overflow-x-auto pb-2">
+          {cats.map((c) => (
+            <button key={c} onClick={() => setCategoryFilter(c)} className="px-3.5 py-1.5 rounded-full text-xs font-medium shrink-0" style={categoryFilter === c ? { background: COLORS.primary, color: COLORS.text } : { background: COLORS.surface, color: COLORS.textMuted, border: `1px solid ${COLORS.border}` }}>
+              {c}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="px-4 pt-2 space-y-3">
+        {loading ? (
+          <div className="flex justify-center py-10"><Loader2 className="w-6 h-6 animate-spin" style={{ color: COLORS.primary }} /></div>
+        ) : displayed.length === 0 ? (
+          <p className="text-sm text-center py-10" style={{ color: COLORS.textMuted }}>Belum ada produk tersedia.</p>
+        ) : (
+          displayed.map((p) => (
+            <div key={p.id} className="rounded-xl overflow-hidden flex gap-3 p-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <div className="w-20 h-20 rounded-lg overflow-hidden shrink-0 flex items-center justify-center" style={{ background: COLORS.surfaceLight }}>
+                {p.imageUrl ? <img src={p.imageUrl} alt={p.name} className="w-full h-full object-cover" /> : <ImagePlus className="w-6 h-6" style={{ color: COLORS.textMuted }} />}
+              </div>
+              <div className="flex-1 min-w-0 flex flex-col">
+                <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{p.name}</p>
+                {p.description && <p className="text-[11px] line-clamp-2" style={{ color: COLORS.textMuted }}>{p.description}</p>}
+                <div className="flex items-center justify-between mt-auto pt-1.5">
+                  <span className="font-display text-sm font-semibold" style={{ color: COLORS.secondary }}>{rupiah(p.sellingPrice)}</span>
+                  {cart[p.id] > 0 ? (
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => removeFromCart(p.id)} className="w-6 h-6 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3 h-3" /></button>
+                      <span className="text-sm font-medium w-4 text-center">{cart[p.id]}</span>
+                      <button onClick={() => addToCart(p.id)} className="w-6 h-6 rounded-full flex items-center justify-center" style={{ background: COLORS.primary, color: COLORS.text }}><Plus className="w-3 h-3" /></button>
+                    </div>
+                  ) : (
+                    <button onClick={() => addToCart(p.id)} className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>+ Tambah</button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {cartCount > 0 && !showCheckout && (
+        <button onClick={() => setShowCheckout(true)} className="fixed bottom-4 left-4 right-4 py-3.5 rounded-2xl flex items-center justify-between px-5 shadow-lg" style={{ background: COLORS.primary, color: COLORS.text }}>
+          <span className="flex items-center gap-2 text-sm font-medium"><ShoppingBag className="w-4 h-4" /> {cartCount} item</span>
+          <span className="font-display font-semibold">{rupiah(cartTotal)} · Checkout</span>
+        </button>
+      )}
+
+      {showCheckout && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={() => !submitting && setShowCheckout(false)}>
+          <div className="w-full max-h-[88vh] overflow-y-auto rounded-t-2xl sm:rounded-2xl sm:max-w-md p-4" style={{ background: COLORS.surface }} onClick={(e) => e.stopPropagation()}>
+            <SectionLabel>Detail Pesanan</SectionLabel>
+            <div className="space-y-2 mb-3">
+              {cartItems.map((c) => (
+                <div key={c.product.id} className="flex items-center justify-between text-sm">
+                  <span style={{ color: COLORS.text }}>{c.product.name} <span style={{ color: COLORS.textMuted }}>×{c.qty}</span></span>
+                  <span style={{ color: COLORS.textMuted }}>{rupiah(c.product.sellingPrice * c.qty)}</span>
+                </div>
+              ))}
+              <div className="flex items-center justify-between text-sm font-semibold pt-2 border-t" style={{ borderColor: COLORS.border, color: COLORS.text }}>
+                <span>Total</span><span>{rupiah(cartTotal)}</span>
+              </div>
+            </div>
+
+            <SectionLabel>Data Pemesan</SectionLabel>
+            <div className="space-y-2.5">
+              <Field label="Nama Pemesan"><input value={form.customerName} onChange={(e) => setForm({ ...form, customerName: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+              <Field label="No. HP / WhatsApp"><input value={form.customerPhone} onChange={(e) => setForm({ ...form, customerPhone: e.target.value })} type="tel" className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+              <Field label="Alamat Pengiriman"><textarea value={form.customerAddress} onChange={(e) => setForm({ ...form, customerAddress: e.target.value })} rows={2} className="w-full bg-transparent outline-none text-sm py-2 resize-none" style={{ color: COLORS.text }} /></Field>
+              <Field label="Request Waktu Pengiriman (opsional)"><input value={form.deliveryTime} onChange={(e) => setForm({ ...form, deliveryTime: e.target.value })} placeholder="Contoh: Sore ini jam 18.00" className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+              <Field label="Metode Pembayaran">
+                <select value={form.paymentMethod} onChange={(e) => setForm({ ...form, paymentMethod: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                  {BUSINESS_CONFIG.paymentMethods.map((m) => <option key={m} value={m} style={{ background: COLORS.surface }}>{m}</option>)}
+                </select>
+              </Field>
+              <Field label="Catatan (opsional)"><input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            </div>
+
+            {submitError && <p className="text-xs mt-2" style={{ color: COLORS.primaryLight }}>{submitError}</p>}
+
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => setShowCheckout(false)} disabled={submitting} className="flex-1 py-2.5 rounded-xl text-sm font-medium disabled:opacity-50" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={submitOrder} disabled={submitting || !form.customerName.trim() || !form.customerPhone.trim() || !form.customerAddress.trim()} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.primary, color: COLORS.text }}>
+                {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Pesan Sekarang
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- PUBLIK: TRACKING PESANAN (tanpa login) ---------------- */
+function OrderTrackingPage() {
+  const { orderId } = useParams();
+  const uid = BUSINESS_CONFIG.ownerUid;
+  const [order, setOrder] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [notFound, setNotFound] = useState(false);
+
+  useEffect(() => {
+    if (!uid || !orderId) return;
+    const unsub = onSnapshot(doc(db, 'users', uid, 'incoming_orders', orderId), (snap) => {
+      if (snap.exists()) setOrder({ id: snap.id, ...snap.data() });
+      else setNotFound(true);
+      setLoading(false);
+    }, () => { setNotFound(true); setLoading(false); });
+    return () => unsub();
+  }, [uid, orderId]);
+
+  if (loading) {
+    return <div className="h-screen flex items-center justify-center" style={{ background: COLORS.bg }}><Loader2 className="w-7 h-7 animate-spin" style={{ color: COLORS.primary }} /></div>;
+  }
+  if (notFound || !order) {
+    return <div className="h-screen flex items-center justify-center px-6 text-center font-sans" style={{ background: COLORS.bg, color: COLORS.textMuted }}>Pesanan tidak ditemukan. Cek kembali link yang kamu buka.</div>;
+  }
+
+  const STAGES = order.status === 'rejected'
+    ? [{ id: 'rejected', label: 'Pesanan Ditolak' }]
+    : [{ id: 'pending', label: 'Menunggu Konfirmasi' }, { id: 'disiapkan', label: 'Sedang Disiapkan' }, { id: 'dikirim', label: 'Proses Pengiriman' }, { id: 'terkirim', label: 'Terkirim' }];
+  const currentStageId = order.status === 'rejected' ? 'rejected' : order.status === 'pending' ? 'pending' : (order.deliveryStatus || 'disiapkan');
+  const currentIdx = STAGES.findIndex((s) => s.id === currentStageId);
+
+  return (
+    <div className="min-h-screen font-sans px-4 py-6" style={{ background: COLORS.bg, color: COLORS.text }}>
+      <div className="max-w-md mx-auto space-y-4">
+        <div className="flex flex-col items-center gap-2 mb-2">
+          <img src="/logo.png" alt={BUSINESS_CONFIG.businessName} className="w-14 h-14 rounded-full object-cover" />
+          <h1 className="font-display text-base font-semibold">{BUSINESS_CONFIG.businessName}</h1>
+        </div>
+
+        <Card>
+          <SectionLabel>Status Pesanan</SectionLabel>
+          {order.status === 'rejected' ? (
+            <p className="text-sm" style={{ color: COLORS.primaryLight }}>Mohon maaf, pesanan ini ditolak oleh toko. Hubungi toko untuk info lebih lanjut.</p>
+          ) : (
+            <div className="space-y-3">
+              {STAGES.map((s, i) => (
+                <div key={s.id} className="flex items-center gap-3">
+                  <span className="w-6 h-6 rounded-full flex items-center justify-center shrink-0" style={{ background: i <= currentIdx ? COLORS.secondary : COLORS.surfaceLight, color: i <= currentIdx ? COLORS.bg : COLORS.textMuted }}>
+                    {i <= currentIdx ? <Check className="w-3.5 h-3.5" /> : <span className="text-[10px]">{i + 1}</span>}
+                  </span>
+                  <span className="text-sm" style={{ color: i <= currentIdx ? COLORS.text : COLORS.textMuted, fontWeight: i === currentIdx ? 600 : 400 }}>{s.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <SectionLabel>Detail Pesanan</SectionLabel>
+          <div className="space-y-1.5 mb-2.5">
+            {(order.items || []).map((i, idx) => (
+              <div key={idx} className="flex items-center justify-between text-sm">
+                <span style={{ color: COLORS.text }}>{i.name} <span style={{ color: COLORS.textMuted }}>×{i.qty}</span></span>
+                <span style={{ color: COLORS.textMuted }}>{rupiah(i.qty * i.price)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center justify-between text-sm font-semibold pt-2 border-t" style={{ borderColor: COLORS.border, color: COLORS.text }}>
+            <span>Total</span><span>{rupiah(order.total)}</span>
+          </div>
+          <div className="mt-3 pt-3 border-t space-y-1" style={{ borderColor: COLORS.border }}>
+            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Nama: <span style={{ color: COLORS.text }}>{order.customerName}</span></p>
+            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Alamat: <span style={{ color: COLORS.text }}>{order.customerAddress}</span></p>
+            {order.deliveryTime && <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Request waktu: <span style={{ color: COLORS.text }}>{order.deliveryTime}</span></p>}
+            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Pembayaran: <span style={{ color: COLORS.text }}>{order.paymentMethod}</span></p>
+          </div>
+        </Card>
+
+        <p className="text-[10px] text-center" style={{ color: COLORS.textMuted }}>Simpan link halaman ini untuk memantau status pesananmu.</p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- OWNER: AUTH GATE ---------------- */
+function OwnerApp() {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [user, setUser] = useState(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return unsub;
+  }, []);
+
+  if (authLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center" style={{ background: COLORS.bg }}>
+        <Loader2 className="w-8 h-8 animate-spin" style={{ color: COLORS.primary }} />
+      </div>
+    );
+  }
+  if (!user) return <LoginScreen />;
+  return <MainApp uid={user.uid} email={user.email} />;
+}
+
+function LoginScreen() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+    } catch (err) {
+      setError('Email atau password salah.');
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="h-screen flex items-center justify-center px-6 font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
+      <form onSubmit={submit} className="w-full max-w-xs space-y-4">
+        <div className="flex flex-col items-center gap-2 mb-2">
+          <img src="/logo.png" alt={BUSINESS_CONFIG.businessName} className="w-20 h-20 rounded-full object-cover" />
+          <h1 className="font-display text-lg font-semibold">{BUSINESS_CONFIG.appName}</h1>
+          <p className="text-xs" style={{ color: COLORS.textMuted }}>{BUSINESS_CONFIG.businessName}</p>
+        </div>
+        <div className="rounded-lg px-3 py-2 border" style={{ borderColor: COLORS.border, background: COLORS.surface }}>
+          <label className="text-[10px] block" style={{ color: COLORS.textMuted }}>Email</label>
+          <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text }} />
+        </div>
+        <div className="rounded-lg px-3 py-2 border" style={{ borderColor: COLORS.border, background: COLORS.surface }}>
+          <label className="text-[10px] block" style={{ color: COLORS.textMuted }}>Password</label>
+          <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text }} />
+        </div>
+        {error && <p className="text-xs" style={{ color: COLORS.primaryLight }}>{error}</p>}
+        <button type="submit" disabled={busy} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text, opacity: busy ? 0.7 : 1 }}>
+          <Lock className="w-3.5 h-3.5" /> {busy ? 'Memproses...' : 'Masuk'}
+        </button>
+        <p className="text-[11px] text-center" style={{ color: COLORS.textMuted }}>Akun dibuat manual lewat Firebase Console — tidak ada pendaftaran di sini.</p>
+      </form>
+    </div>
+  );
+}
+
+/* ---------------- MAIN APP ---------------- */
+function MainApp({ uid, email }) {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [activeTab, setActiveTab] = useState('dashboard');
+
+  const [rawMaterials, setRawMaterials] = useState([]);
+  const [baseStock, setBaseStock] = useState([]);
+  const [finishedStock, setFinishedStock] = useState([]);
+  const [salesRecords, setSalesRecords] = useState([]);
+  const [employees, setEmployees] = useState([]);
+  const [targetSettings, setTargetSettings] = useState({ bufferAmount: 0 });
+  const [channels, setChannels] = useState([]);
+  const [affiliates, setAffiliates] = useState([]);
+  const [affiliateSales, setAffiliateSales] = useState([]);
+  const [productionLog, setProductionLog] = useState([]);
+  const [wasteLog, setWasteLog] = useState([]);
+  const [purchaseLog, setPurchaseLog] = useState([]);
+  const [pendingOrders, setPendingOrders] = useState([]);
+  const [activeDeliveries, setActiveDeliveries] = useState([]);
+  const [promos, setPromos] = useState([]);
+  const [affiliatePayments, setAffiliatePayments] = useState([]);
+
+  // Dengarkan "Pesanan Masuk" dari Checkout publik secara realtime.
+  // Disimpan sebagai dokumen terpisah per pesanan (bukan satu array besar)
+  // supaya beberapa checkout yang terjadi bersamaan tidak saling menimpa.
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, 'users', uid, 'incoming_orders'), (snap) => {
+      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const sortDesc = (a, b) => {
+        const ta = a.createdAt?.toMillis ? a.createdAt.toMillis() : 0;
+        const tb = b.createdAt?.toMillis ? b.createdAt.toMillis() : 0;
+        return tb - ta;
+      };
+      setPendingOrders(all.filter((o) => o.status === 'pending').sort(sortDesc));
+      setActiveDeliveries(all.filter((o) => o.status === 'confirmed' && o.deliveryStatus !== 'terkirim').sort(sortDesc));
+    }, (err) => console.error('Gagal memuat pesanan masuk', err));
+    return () => unsub();
+  }, [uid]);
+
+  useEffect(() => {
+    (async () => {
+      const [rm, bs, fs, sr, emp, ts, ch, aff, affSales, prodLog, waste, purchases, promoList, affPayments] = await Promise.all([
+        loadKey(uid, 'raw-materials', []),
+        loadKey(uid, 'base-stock', []),
+        loadKey(uid, 'finished-stock', []),
+        loadKey(uid, 'sales-records', []),
+        loadKey(uid, 'employees', []),
+        loadKey(uid, 'target-settings', { bufferAmount: 0 }),
+        loadKey(uid, 'channels', []),
+        loadKey(uid, 'affiliates', []),
+        loadKey(uid, 'affiliate-sales', []),
+        loadKey(uid, 'production-log', []),
+        loadKey(uid, 'waste-log', []),
+        loadKey(uid, 'purchase-log', []),
+        loadKey(uid, 'promos', []),
+        loadKey(uid, 'affiliate-payments', []),
+      ]);
+      setRawMaterials(rm);
+      setBaseStock(bs);
+      setFinishedStock(fs);
+      setSalesRecords(sr);
+      setEmployees(emp);
+      setTargetSettings(ts);
+      setChannels(ch);
+      setAffiliates(aff);
+      setAffiliateSales(affSales);
+      setProductionLog(prodLog);
+      setWasteLog(waste);
+      setPurchaseLog(purchases);
+      setPromos(promoList);
+      setAffiliatePayments(affPayments);
+      setLoading(false);
+    })();
+  }, [uid]);
+
+  const persist = useCallback(async (key, setter, value) => {
+    setter(value);
+    setSaving(true);
+    await saveKey(uid, key, value);
+    setSaving(false);
+  }, [uid]);
+
+  if (loading) {
+    return (
+      <div className="h-screen flex items-center justify-center" style={{ background: COLORS.bg }}>
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-8 h-8 animate-spin" style={{ color: COLORS.primary }} />
+          <span className="text-sm" style={{ color: COLORS.textMuted }}>Memuat data...</span>
+        </div>
+      </div>
+    );
+  }
+
+  const saveRaw = (v) => persist('raw-materials', setRawMaterials, v);
+  const saveBase = (v) => persist('base-stock', setBaseStock, v);
+  const saveFinished = (v) => persist('finished-stock', setFinishedStock, v);
+  const saveSales = (v) => persist('sales-records', setSalesRecords, v);
+  const saveEmployees = (v) => persist('employees', setEmployees, v);
+  const saveTargetSettings = (v) => persist('target-settings', setTargetSettings, v);
+  const saveChannels = (v) => persist('channels', setChannels, v);
+  const saveAffiliates = (v) => persist('affiliates', setAffiliates, v);
+  const saveAffiliateSales = (v) => persist('affiliate-sales', setAffiliateSales, v);
+  const saveProductionLog = (v) => persist('production-log', setProductionLog, v);
+  const saveWasteLog = (v) => persist('waste-log', setWasteLog, v);
+  const savePurchaseLog = (v) => persist('purchase-log', setPurchaseLog, v);
+  const savePromos = (v) => persist('promos', setPromos, v);
+  const saveAffiliatePayments = (v) => persist('affiliate-payments', setAffiliatePayments, v);
+
+  // Mengonfirmasi satu pesanan dari website: menambahkannya ke rekap penjualan
+  // channel "Website" pada tanggal pesanan tersebut (menambah baris, bukan
+  // menimpa item yang sudah ada di hari itu), lalu memotong stok bahan baku /
+  // base / produk jadi sesuai item yang dikonfirmasi saja. Baru pada titik ini
+  // pesanan mempengaruhi laporan keuangan & stok -- itulah sebabnya pesanan
+  // ditahan dulu sebagai "pending" alih-alih langsung tercatat saat checkout.
+  const confirmIncomingOrder = async (order) => {
+    const dateISO = order.createdAt?.toDate ? order.createdAt.toDate().toISOString().slice(0, 10) : todayISO();
+    const channelName = 'Website';
+
+    if (!channels.some((c) => c.name === channelName)) {
+      saveChannels([...channels, { id: genId(), name: channelName }]);
+    }
+
+    const orderItems = (order.items || []).map((i) => {
+      const match = finishedStock.find((f) => f.name.trim().toLowerCase() === (i.name || '').trim().toLowerCase());
+      const hpp = match ? menuHpp(match, rawMaterials, baseStock) : 0;
+      return { name: (i.name || '').trim(), qty: i.qty || 0, price: i.price || 0, hpp };
+    });
+
+    const prevRecord = salesRecords.find((r) => r.date === dateISO && r.channel === channelName);
+    const combinedItems = prevRecord ? [...prevRecord.items, ...orderItems] : orderItems;
+    const totalRevenue = combinedItems.reduce((s, i) => s + i.qty * i.price, 0);
+    const totalHpp = combinedItems.reduce((s, i) => s + i.qty * i.hpp, 0);
+    const record = {
+      id: prevRecord ? prevRecord.id : genId(),
+      date: dateISO,
+      channel: channelName,
+      items: combinedItems,
+      total: totalRevenue,
+      hpp: totalHpp,
+      margin: totalRevenue - totalHpp,
+      notes: prevRecord ? prevRecord.notes || '' : (order.customerName ? `Pesanan online: ${order.customerName}` : ''),
+      updatedAt: new Date().toISOString(),
+    };
+    const nextRecords = prevRecord ? salesRecords.map((r) => (r.id === prevRecord.id ? record : r)) : [...salesRecords, record];
+    await saveSales(nextRecords);
+
+    // Potong stok HANYA untuk item pesanan yang baru dikonfirmasi ini
+    // (item yang sudah ada sebelumnya di rekap hari itu sudah pernah dipotong).
+    let nextFinished = finishedStock;
+    const rawDeltaMap = {};
+    const baseDeltaMap = {};
+    orderItems.forEach((oi) => {
+      const match = finishedStock.find((f) => f.name.trim().toLowerCase() === oi.name.toLowerCase());
+      if (!match || oi.qty <= 0) return;
+      if (match.recipeBased) {
+        (match.recipe || []).forEach((ing) => {
+          const type = ingSourceType(ing);
+          const id = ingSourceId(ing);
+          if (type === 'base') baseDeltaMap[id] = (baseDeltaMap[id] || 0) + ing.qty * oi.qty;
+          else rawDeltaMap[id] = (rawDeltaMap[id] || 0) + ing.qty * oi.qty;
+        });
+      } else {
+        nextFinished = nextFinished.map((f) => (f.id === match.id ? { ...f, currentStock: Math.max(0, f.currentStock - oi.qty) } : f));
+      }
+    });
+    if (nextFinished !== finishedStock) await saveFinished(nextFinished);
+    if (Object.keys(rawDeltaMap).length > 0) {
+      await saveRaw(rawMaterials.map((rm) => (rawDeltaMap[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDeltaMap[rm.id]) } : rm)));
+    }
+    if (Object.keys(baseDeltaMap).length > 0) {
+      await saveBase(baseStock.map((b) => (baseDeltaMap[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDeltaMap[b.id]) } : b)));
+    }
+
+    await updateDoc(doc(db, 'users', uid, 'incoming_orders', order.id), {
+      status: 'confirmed',
+      deliveryStatus: 'disiapkan',
+      confirmedAt: serverTimestamp(),
+    });
+  };
+
+  const advanceDelivery = async (order, deliveryStatus) => {
+    await updateDoc(doc(db, 'users', uid, 'incoming_orders', order.id), { deliveryStatus });
+  };
+
+  const rejectIncomingOrder = async (order) => {
+    await updateDoc(doc(db, 'users', uid, 'incoming_orders', order.id), {
+      status: 'rejected',
+      rejectedAt: serverTimestamp(),
+    });
+  };
+
+  return (
+    <div className="h-screen flex flex-col font-sans" style={{ background: COLORS.bg, color: COLORS.text }}>
+      <Header saving={saving} email={email} />
+      <main className="flex-1 overflow-y-auto px-4 pt-4 pb-6 w-full">
+        {activeTab === 'dashboard' && (
+          <Dashboard rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} employees={employees} targetSettings={targetSettings} wasteLog={wasteLog} purchaseLog={purchaseLog} affiliateSales={affiliateSales} affiliatePayments={affiliatePayments} promos={promos} />
+        )}
+        {activeTab === 'stok' && (
+          <StokTab
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} productionLog={productionLog} wasteLog={wasteLog}
+            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveProductionLog={saveProductionLog} onSaveWasteLog={saveWasteLog}
+          />
+        )}
+        {activeTab === 'etalase' && (
+          <EtalaseTab uid={uid} finishedStock={finishedStock} onSaveFinished={saveFinished} />
+        )}
+        {activeTab === 'penjualan' && (
+          <PenjualanTab
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} salesRecords={salesRecords} channels={channels}
+            onSaveSales={saveSales} onSaveFinished={saveFinished} onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveChannels={saveChannels}
+            pendingOrders={pendingOrders} onConfirmOrder={confirmIncomingOrder} onRejectOrder={rejectIncomingOrder}
+            activeDeliveries={activeDeliveries} onAdvanceDelivery={advanceDelivery}
+            affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliateSales={saveAffiliateSales}
+          />
+        )}
+        {activeTab === 'returan' && (
+          <ReturanTab
+            rawMaterials={rawMaterials} baseStock={baseStock} finishedStock={finishedStock} wasteLog={wasteLog}
+            onSaveRaw={saveRaw} onSaveBase={saveBase} onSaveFinished={saveFinished} onSaveWasteLog={saveWasteLog}
+          />
+        )}
+        {activeTab === 'keuangan' && (
+          <KeuanganTab
+            employees={employees} targetSettings={targetSettings} salesRecords={salesRecords}
+            onSaveEmployees={saveEmployees} onSaveTargetSettings={saveTargetSettings}
+            rawMaterials={rawMaterials} purchaseLog={purchaseLog} onSaveRaw={saveRaw} onSavePurchaseLog={savePurchaseLog}
+            finishedStock={finishedStock} onSaveFinished={saveFinished}
+          />
+        )}
+        {activeTab === 'marketing' && (
+          <MarketingTab
+            affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={saveAffiliates} onSaveAffiliateSales={saveAffiliateSales}
+            affiliatePayments={affiliatePayments} onSaveAffiliatePayments={saveAffiliatePayments}
+            promos={promos} onSavePromos={savePromos}
+          />
+        )}
+        {activeTab === 'riwayat' && (
+          <RiwayatTab
+            salesRecords={salesRecords} onSaveSales={saveSales} wasteLog={wasteLog} onSaveWasteLog={saveWasteLog}
+            affiliateSales={affiliateSales} onSaveAffiliateSales={saveAffiliateSales}
+            purchaseLog={purchaseLog} rawMaterials={rawMaterials} finishedStock={finishedStock} onSaveRaw={saveRaw} onSaveFinished={saveFinished} onSavePurchaseLog={savePurchaseLog}
+            onResetAll={async () => {
+              await persist('raw-materials', setRawMaterials, []);
+              await persist('base-stock', setBaseStock, []);
+              await persist('finished-stock', setFinishedStock, []);
+              await persist('sales-records', setSalesRecords, []);
+              await persist('employees', setEmployees, []);
+              await persist('target-settings', setTargetSettings, { bufferAmount: 0 });
+              await persist('channels', setChannels, []);
+              await persist('affiliates', setAffiliates, []);
+              await persist('affiliate-sales', setAffiliateSales, []);
+              await persist('production-log', setProductionLog, []);
+              await persist('waste-log', setWasteLog, []);
+              await persist('purchase-log', setPurchaseLog, []);
+              await persist('promos', setPromos, []);
+              await persist('affiliate-payments', setAffiliatePayments, []);
+            }}
+          />
+        )}
+      </main>
+      <nav className="shrink-0 flex border-t w-full" style={{ borderColor: COLORS.border, background: COLORS.surface }}>
+        {TABS.map((t) => {
+          const Icon = t.icon;
+          const active = activeTab === t.id;
+          const showBadge = t.id === 'penjualan' && pendingOrders.length > 0;
+          return (
+            <button key={t.id} onClick={() => setActiveTab(t.id)} className="flex-1 flex flex-col items-center gap-0.5 py-2 px-0.5 transition-colors relative min-w-0" style={{ color: active ? COLORS.primaryLight : COLORS.textMuted }}>
+              <span className="relative">
+                <Icon className="w-[18px] h-[18px]" strokeWidth={active ? 2.5 : 2} />
+                {showBadge && (
+                  <span className="absolute -top-1 -right-1.5 min-w-[14px] h-[14px] px-[3px] rounded-full text-[8px] font-bold flex items-center justify-center" style={{ background: COLORS.primary, color: '#fff' }}>
+                    {pendingOrders.length}
+                  </span>
+                )}
+              </span>
+              <span className="text-[9px] font-medium leading-none truncate max-w-full">{t.label}</span>
+            </button>
+          );
+        })}
+      </nav>
+    </div>
+  );
+}
+
+function Header({ saving, email }) {
+  return (
+    <header className="shrink-0 px-4 py-3.5 flex items-center justify-between w-full" style={{ borderBottom: `1px solid ${COLORS.border}`, background: `linear-gradient(180deg, ${COLORS.surfaceLight}, ${COLORS.bg})` }}>
+      <div className="flex items-center gap-2.5 min-w-0">
+        <img src="/logo.png" alt={BUSINESS_CONFIG.businessName} className="w-9 h-9 rounded-full object-cover shrink-0" />
+        <div className="min-w-0">
+          <h1 className="font-display text-base font-semibold leading-tight truncate" style={{ color: COLORS.text }}>{BUSINESS_CONFIG.appName}</h1>
+          <p className="text-[11px] leading-tight truncate" style={{ color: COLORS.textMuted }}>{email}</p>
+        </div>
+      </div>
+      <div className="flex items-center gap-2.5 shrink-0">
+        <span className="text-[10px] w-10 text-right" style={{ color: saving ? COLORS.warning : 'transparent' }}>{saving ? 'saving' : 'ok'}</span>
+        <button onClick={() => signOut(auth)} style={{ color: COLORS.textMuted }} aria-label="Keluar"><LogOut className="w-4 h-4" /></button>
+      </div>
+    </header>
+  );
+}
+
+function Card({ children, className = '' }) {
+  return <div className={`rounded-2xl p-4 ${className}`} style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>{children}</div>;
+}
+function SectionLabel({ children }) {
+  return <h2 className="font-display text-xs font-semibold uppercase tracking-wider mb-2.5" style={{ color: COLORS.textMuted }}>{children}</h2>;
+}
+function Field({ label, children }) {
+  return (
+    <div className="rounded-lg px-3 border" style={{ borderColor: COLORS.border, background: COLORS.bg }}>
+      <label className="text-[10px] block pt-1.5" style={{ color: COLORS.textMuted }}>{label}</label>
+      {children}
+    </div>
+  );
+}
+function WasteFormPanel({ item, sub, wasteForm, setWasteForm, onCancel, onSubmit, rawMaterials, baseStock }) {
+  const qty = parseFloat(wasteForm.qty) || 0;
+  const estCost = qty * (sub === 'pizza' ? menuHpp(item, rawMaterials, baseStock) : sub === 'base' ? computeBaseUnitCost(item, rawMaterials) : (item.purchasePrice || 0));
+
+  return (
+    <div className="mt-3 pt-3 border-t space-y-2.5" style={{ borderColor: COLORS.border }}>
+      <Field label={`Jumlah (${item.unit})`}>
+        <input type="number" value={wasteForm.qty} onChange={(e) => setWasteForm({ ...wasteForm, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+      </Field>
+
+      <Field label="Alasan">
+        <select value={wasteForm.reason} onChange={(e) => setWasteForm({ ...wasteForm, reason: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+          {['rusak', 'kadaluarsa', 'gagal-produksi', 'lainnya'].map((r) => <option key={r} value={r} style={{ background: COLORS.surface }}>{WASTE_REASONS[r]}</option>)}
+        </select>
+      </Field>
+
+      <Field label="Catatan (opsional)">
+        <input value={wasteForm.notes} onChange={(e) => setWasteForm({ ...wasteForm, notes: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+      </Field>
+
+      <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+        <span style={{ color: COLORS.textMuted }}>Estimasi dampak biaya</span>
+        <span className="font-semibold" style={{ color: estCost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{rupiah(estCost)}</span>
+      </div>
+
+      <div className="flex gap-2">
+        <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+        <button onClick={onSubmit} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.warning, color: COLORS.bg }}><Check className="w-4 h-4" /> Simpan</button>
+      </div>
+    </div>
+  );
+}
+/* ---------------- RETURAN TAB (Retur Pelanggan: Bagus -> stok lagi, Rusak -> jadi kerugian) ---------------- */
+function ReturanTab({ rawMaterials, baseStock, finishedStock, wasteLog, onSaveRaw, onSaveBase, onSaveFinished, onSaveWasteLog }) {
+  const [form, setForm] = useState({ itemId: '', date: todayISO(), qty: '', kondisi: 'bagus', notes: '' });
+  const [expandedMonth, setExpandedMonth] = useState(null);
+
+  const selectedItem = finishedStock.find((f) => f.id === form.itemId);
+  const qtyNum = parseFloat(form.qty) || 0;
+  const previewCost = selectedItem && form.kondisi === 'rusak' ? qtyNum * menuHpp(selectedItem, rawMaterials, baseStock) : 0;
+
+  const submit = () => {
+    if (!selectedItem || qtyNum <= 0) return;
+    if (form.kondisi === 'bagus') {
+      if (selectedItem.recipeBased) applyRecipeDeltaGlobal(selectedItem.recipe, -qtyNum, rawMaterials, baseStock, onSaveRaw, onSaveBase);
+      else onSaveFinished(finishedStock.map((f) => (f.id === selectedItem.id ? { ...f, currentStock: f.currentStock + qtyNum } : f)));
+      onSaveWasteLog([...wasteLog, { id: genId(), date: form.date, sourceType: 'pizza', sourceId: selectedItem.id, sourceName: selectedItem.name, qty: qtyNum, unit: selectedItem.unit, cost: 0, reason: 'retur-bagus', notes: form.notes.trim() }]);
+    } else {
+      const cost = qtyNum * menuHpp(selectedItem, rawMaterials, baseStock);
+      onSaveWasteLog([...wasteLog, { id: genId(), date: form.date, sourceType: 'pizza', sourceId: selectedItem.id, sourceName: selectedItem.name, qty: qtyNum, unit: selectedItem.unit, cost, reason: 'retur-rusak', notes: form.notes.trim() }]);
+    }
+    setForm({ itemId: '', date: form.date, qty: '', kondisi: 'bagus', notes: '' });
+  };
+
+  const returOnly = wasteLog.filter((w) => (w.reason || '').startsWith('retur'));
+  const removeEntry = (id) => onSaveWasteLog(wasteLog.filter((w) => w.id !== id));
+
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+  const todayCount = returOnly.filter((w) => w.date === today).length;
+  const monthReturs = returOnly.filter((w) => w.date.startsWith(monthPrefix));
+  const monthCost = monthReturs.reduce((s, w) => s + w.cost, 0);
+
+  const byMonth = {};
+  returOnly.forEach((w) => { const mp = w.date.slice(0, 7); (byMonth[mp] = byMonth[mp] || []).push(w); });
+  const monthKeys = Object.keys(byMonth).sort((a, b) => (a < b ? 1 : -1));
+  const monthLabelOf = (mp) => new Date(mp + '-01T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Retur hari ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{todayCount} kejadian</p>
+        </Card>
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Biaya retur bulan ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(monthCost)}</p>
+          <p className="text-[10px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Catat Retur Pelanggan</SectionLabel>
+        <Card>
+          <div className="space-y-2.5">
+            <Field label="Menu Jadi">
+              <select value={form.itemId} onChange={(e) => setForm({ ...form, itemId: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>Pilih menu</option>
+                {finishedStock.map((f) => <option key={f.id} value={f.id} style={{ background: COLORS.surface }}>{f.name}</option>)}
+              </select>
+            </Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Tanggal">
+                <input type="date" value={form.date} max={todayISO()} onChange={(e) => setForm({ ...form, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} />
+              </Field>
+              <Field label={`Jumlah${selectedItem ? ` (${selectedItem.unit})` : ''}`}>
+                <input type="number" value={form.qty} onChange={(e) => setForm({ ...form, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+            </div>
+            <button type="button" onClick={() => setForm({ ...form, kondisi: form.kondisi === 'bagus' ? 'rusak' : 'bagus' })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: form.kondisi === 'bagus' ? 'rgba(122,154,87,0.12)' : 'rgba(193,57,31,0.1)' }}>
+              <span style={{ color: COLORS.text }}>Kondisi: {form.kondisi === 'bagus' ? 'Masih Bagus (masuk stok lagi)' : 'Rusak (jadi biaya kerugian)'}</span>
+              <span className="text-xs font-medium" style={{ color: form.kondisi === 'bagus' ? COLORS.secondary : COLORS.primaryLight }}>Ganti</span>
+            </button>
+            <Field label="Catatan (opsional)">
+              <input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+            </Field>
+          </div>
+          <div className="rounded-lg px-3 py-2 mt-2.5 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+            <span style={{ color: COLORS.textMuted }}>{form.kondisi === 'bagus' ? 'Stok akan ditambah, tanpa biaya' : 'Estimasi dampak biaya'}</span>
+            <span className="font-semibold" style={{ color: previewCost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{rupiah(previewCost)}</span>
+          </div>
+          <button onClick={submit} disabled={!selectedItem || qtyNum <= 0} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+            <RotateCcw className="w-4 h-4" /> Simpan Retur
+          </button>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Riwayat Retur</SectionLabel>
+        {monthKeys.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan retur.</p></Card>
+        ) : (
+          <div className="space-y-2">
+            {monthKeys.map((mp) => {
+              const isOpen = expandedMonth === mp;
+              const entries = [...byMonth[mp]].sort((a, b) => (a.date < b.date ? 1 : -1));
+              const total = entries.reduce((s, w) => s + w.cost, 0);
+              return (
+                <div key={mp} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                  <button onClick={() => setExpandedMonth(isOpen ? null : mp)} className="w-full flex items-center justify-between px-3.5 py-3">
+                    <span className="text-sm font-medium" style={{ color: COLORS.text }}>{monthLabelOf(mp)}{mp === monthPrefix ? ' (bulan ini)' : ''}</span>
+                    <span className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{entries.length} kejadian · {rupiah(total)}</span>
+                  </button>
+                  {isOpen && (
+                    <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                      {entries.map((w) => (
+                        <div key={w.id} className="flex items-start justify-between text-sm mt-2">
+                          <div className="min-w-0">
+                            <p style={{ color: COLORS.text }}>
+                              {w.sourceName}
+                              <span className="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style={{ background: w.reason === 'retur-bagus' ? 'rgba(122,154,87,0.15)' : 'rgba(193,57,31,0.15)', color: w.reason === 'retur-bagus' ? COLORS.secondary : COLORS.primaryLight }}>{w.reason === 'retur-bagus' ? 'Bagus' : 'Rusak'}</span>
+                              <span style={{ color: COLORS.textMuted }}> · {w.qty} {w.unit}</span>
+                            </p>
+                            <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(w.date)}{w.notes ? ` · "${w.notes}"` : ''}</p>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="font-medium" style={{ color: w.cost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{w.cost > 0 ? rupiah(w.cost) : '-'}</span>
+                            <button onClick={() => removeEntry(w.id)} style={{ color: COLORS.textMuted }}><Trash2 className="w-3.5 h-3.5" /></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- ETALASE TAB (kelola tampilan produk untuk Checkout publik) ---------------- */
+function EtalaseTab({ uid, finishedStock, onSaveFinished }) {
+  const [categoryFilter, setCategoryFilter] = useState('Semua');
+  const [editItem, setEditItem] = useState(null); // { id, name, sellingPrice, description, imageUrl, category, showInEtalase }
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+
+  const displayed = categoryFilter === 'Semua' ? finishedStock : finishedStock.filter((f) => (f.category || 'Lainnya') === categoryFilter);
+  const shownCount = finishedStock.filter((f) => f.showInEtalase).length;
+
+  const openEdit = (item) => setEditItem({
+    id: item.id, name: item.name, sellingPrice: String(item.sellingPrice || ''),
+    description: item.description || '', imageUrl: item.imageUrl || '', category: item.category || CATEGORIES[0] || 'Lainnya',
+    showInEtalase: !!item.showInEtalase,
+  });
+
+  const syncPublicProduct = async (item) => {
+    try {
+      const ref = doc(db, 'users', uid, 'public_products', item.id);
+      if (item.showInEtalase) {
+        await setDoc(ref, {
+          name: item.name, category: item.category || 'Lainnya', sellingPrice: item.sellingPrice || 0,
+          description: item.description || '', imageUrl: item.imageUrl || '', unit: item.unit || 'pcs',
+        });
+      } else {
+        await deleteDoc(ref).catch(() => {});
+      }
+    } catch (e) {
+      console.error('Gagal sinkron produk publik', e);
+    }
+  };
+
+  const save = () => {
+    if (!editItem.name.trim()) return;
+    const updated = {
+      ...finishedStock.find((f) => f.id === editItem.id),
+      name: editItem.name.trim(), sellingPrice: parseFloat(editItem.sellingPrice) || 0,
+      description: editItem.description.trim(), imageUrl: editItem.imageUrl, category: editItem.category, showInEtalase: editItem.showInEtalase,
+    };
+    onSaveFinished(finishedStock.map((f) => (f.id === editItem.id ? updated : f)));
+    syncPublicProduct(updated);
+    setEditItem(null);
+  };
+
+  const toggleShow = (item) => {
+    const updated = { ...item, showInEtalase: !item.showInEtalase };
+    onSaveFinished(finishedStock.map((f) => (f.id === item.id ? updated : f)));
+    syncPublicProduct(updated);
+  };
+
+  const handleFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file || !editItem) return;
+    setUploadError('');
+    setUploading(true);
+    try {
+      const url = await uploadProductImage(uid, editItem.id, file);
+      setEditItem({ ...editItem, imageUrl: url });
+    } catch (err) {
+      console.error(err);
+      setUploadError('Gagal upload gambar. Cek koneksi atau coba file lain.');
+    }
+    setUploading(false);
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <div className="flex items-center justify-between">
+          <span className="text-sm flex items-center gap-1.5" style={{ color: COLORS.textMuted }}><ShoppingBag className="w-3.5 h-3.5" /> Tampil di Etalase</span>
+          <span className="font-display text-base font-semibold" style={{ color: COLORS.text }}>{shownCount} dari {finishedStock.length} produk</span>
+        </div>
+        <p className="text-[10px] mt-1.5" style={{ color: COLORS.textMuted }}>Cuma produk yang di-toggle "Tampil" di bawah yang muncul di halaman Checkout publik.</p>
+      </Card>
+
+      <div className="flex gap-1.5 overflow-x-auto pb-0.5">
+        {['Semua', ...CATEGORIES].map((c) => (
+          <button key={c} onClick={() => setCategoryFilter(c)} className="px-3 py-1.5 rounded-full text-xs font-medium shrink-0" style={categoryFilter === c ? { background: COLORS.secondary, color: COLORS.bg } : { background: COLORS.surface, color: COLORS.textMuted, border: `1px solid ${COLORS.border}` }}>
+            {c}
+          </button>
+        ))}
+      </div>
+
+      {displayed.length === 0 ? (
+        <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada produk di kategori ini. Tambahkan dulu lewat tab Stok &gt; Menu Jadi.</p></Card>
+      ) : (
+        <div className="space-y-2">
+          {displayed.map((item) => (
+            <div key={item.id} className="rounded-xl overflow-hidden flex items-center gap-3 px-3 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <div className="w-14 h-14 rounded-lg overflow-hidden shrink-0 flex items-center justify-center" style={{ background: COLORS.surfaceLight }}>
+                {item.imageUrl ? <img src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" /> : <ImagePlus className="w-5 h-5" style={{ color: COLORS.textMuted }} />}
+              </div>
+              <div className="flex-1 min-w-0" onClick={() => openEdit(item)}>
+                <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{item.name}</p>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{rupiah(item.sellingPrice)} · {item.category || 'Lainnya'}</p>
+                {!item.description && <p className="text-[10px] italic" style={{ color: COLORS.warning }}>Belum ada deskripsi</p>}
+              </div>
+              <div className="flex flex-col items-center gap-1.5 shrink-0">
+                <button onClick={() => toggleShow(item)} className="p-1.5 rounded-md" style={{ color: item.showInEtalase ? COLORS.secondary : COLORS.textMuted }}>
+                  {item.showInEtalase ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                </button>
+                <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editItem && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={() => setEditItem(null)}>
+          <div className="w-full max-h-[85vh] overflow-y-auto rounded-t-2xl sm:rounded-2xl sm:max-w-md p-4" style={{ background: COLORS.surface }} onClick={(e) => e.stopPropagation()}>
+            <SectionLabel>Edit Produk di Etalase</SectionLabel>
+            <div className="space-y-2.5">
+              <div className="flex items-center gap-3">
+                <div className="w-20 h-20 rounded-xl overflow-hidden shrink-0 flex items-center justify-center" style={{ background: COLORS.surfaceLight }}>
+                  {uploading ? <Loader2 className="w-5 h-5 animate-spin" style={{ color: COLORS.textMuted }} /> : editItem.imageUrl ? <img src={editItem.imageUrl} alt="" className="w-full h-full object-cover" /> : <ImagePlus className="w-6 h-6" style={{ color: COLORS.textMuted }} />}
+                </div>
+                <label className="flex-1 text-center py-2.5 rounded-lg text-xs font-medium cursor-pointer" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+                  {editItem.imageUrl ? 'Ganti Foto' : 'Upload Foto'}
+                  <input type="file" accept="image/*" className="hidden" onChange={handleFile} disabled={uploading} />
+                </label>
+              </div>
+              {uploadError && <p className="text-[11px]" style={{ color: COLORS.primaryLight }}>{uploadError}</p>}
+
+              <Field label="Nama Produk">
+                <input value={editItem.name} onChange={(e) => setEditItem({ ...editItem, name: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+              <Field label="Kategori">
+                <select value={editItem.category} onChange={(e) => setEditItem({ ...editItem, category: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                  {CATEGORIES.map((c) => <option key={c} value={c} style={{ background: COLORS.surface }}>{c}</option>)}
+                </select>
+              </Field>
+              <Field label="Harga Jual">
+                <input type="number" value={editItem.sellingPrice} onChange={(e) => setEditItem({ ...editItem, sellingPrice: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+              <Field label="Deskripsi">
+                <textarea value={editItem.description} onChange={(e) => setEditItem({ ...editItem, description: e.target.value })} rows={3} placeholder="Ceritakan produk ini ke pelanggan..." className="w-full bg-transparent outline-none text-sm py-2 resize-none" style={{ color: COLORS.text }} />
+              </Field>
+              <button type="button" onClick={() => setEditItem({ ...editItem, showInEtalase: !editItem.showInEtalase })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: editItem.showInEtalase ? 'rgba(122,154,87,0.12)' : COLORS.bg }}>
+                <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}>{editItem.showInEtalase ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />} Tampil di Etalase publik</span>
+                <span className="w-9 h-5 rounded-full relative transition-colors" style={{ background: editItem.showInEtalase ? COLORS.secondary : COLORS.border }}>
+                  <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: editItem.showInEtalase ? '18px' : '2px' }} />
+                </span>
+              </button>
+            </div>
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => setEditItem(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={save} disabled={uploading} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReorderButtons({ index, total, onMoveUp, onMoveDown }) {
+  return (
+    <div className="flex flex-col gap-0.5 shrink-0">
+      <button onClick={onMoveUp} disabled={index === 0} className="p-0.5 rounded disabled:opacity-30" style={{ color: COLORS.textMuted }}><ChevronUp className="w-3.5 h-3.5" /></button>
+      <button onClick={onMoveDown} disabled={index === total - 1} className="p-0.5 rounded disabled:opacity-30" style={{ color: COLORS.textMuted }}><ChevronDown className="w-3.5 h-3.5" /></button>
+    </div>
+  );
+}
+
+/* ---------------- DASHBOARD ---------------- */
+function GrowthBadge({ pct, label }) {
+  if (pct === null) return <p className="text-[10px] mt-0.5" style={{ color: COLORS.textMuted }}>Belum ada data pembanding</p>;
+  const up = pct >= 0;
+  return (
+    <p className="text-[11px] mt-0.5 flex items-center gap-1" style={{ color: up ? COLORS.secondary : COLORS.warning }}>
+      {up ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />}
+      {Math.abs(pct).toFixed(1)}% {label}
+    </p>
+  );
+}
+
+function TrendChart({ data }) {
+  const w = 300, h = 90, pad = 4;
+  const maxVal = Math.max(1, ...data.map((d) => Math.max(d.omzet, d.laba)));
+  const stepX = (w - pad * 2) / Math.max(1, data.length - 1);
+  const toY = (v) => h - pad - (v / maxVal) * (h - pad * 2);
+  const pathFor = (key) => data.map((d, i) => `${i === 0 ? 'M' : 'L'} ${pad + i * stepX} ${toY(d[key])}`).join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 90 }} preserveAspectRatio="none">
+      <path d={pathFor('omzet')} fill="none" stroke={COLORS.primary} strokeWidth="2" />
+      <path d={pathFor('laba')} fill="none" stroke={COLORS.secondary} strokeWidth="2" />
+    </svg>
+  );
+}
+
+function Dashboard({ rawMaterials, baseStock, finishedStock, salesRecords, employees, targetSettings, wasteLog, purchaseLog, affiliateSales, affiliatePayments, promos }) {
+  const today = todayISO();
+  const todayRecords = salesRecords.filter((r) => r.date === today);
+  const todayTotal = todayRecords.reduce((s, r) => s + r.total, 0);
+  const todayMargin = todayRecords.reduce((s, r) => s + getMargin(r), 0);
+  const todayItems = todayRecords.reduce((s, r) => s + r.items.reduce((s2, i) => s2 + Number(i.qty || 0), 0), 0);
+  const todayByChannel = {};
+  todayRecords.forEach((r) => { const c = r.channel || 'Tanpa channel'; todayByChannel[c] = (todayByChannel[c] || 0) + r.total; });
+
+  const weekAgo = new Date();
+  weekAgo.setDate(weekAgo.getDate() - 6);
+  const weekAgoISO = weekAgo.toISOString().slice(0, 10);
+  const weekRecords = salesRecords.filter((r) => r.date >= weekAgoISO && r.date <= today);
+  const weekTotal = weekRecords.reduce((s, r) => s + r.total, 0);
+  const weekMargin = weekRecords.reduce((s, r) => s + getMargin(r), 0);
+
+  // Perbandingan pertumbuhan: minggu ini vs minggu lalu, bulan ini vs bulan lalu
+  const prevWeekEnd = new Date(weekAgo); prevWeekEnd.setDate(prevWeekEnd.getDate() - 1);
+  const prevWeekStart = new Date(prevWeekEnd); prevWeekStart.setDate(prevWeekStart.getDate() - 6);
+  const prevWeekStartISO = prevWeekStart.toISOString().slice(0, 10);
+  const prevWeekEndISO = prevWeekEnd.toISOString().slice(0, 10);
+  const prevWeekTotal = salesRecords.filter((r) => r.date >= prevWeekStartISO && r.date <= prevWeekEndISO).reduce((s, r) => s + r.total, 0);
+  const weekGrowthPct = prevWeekTotal > 0 ? ((weekTotal - prevWeekTotal) / prevWeekTotal) * 100 : null;
+
+  const now = new Date();
+  const thisMonthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastMonthPrefix = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}`;
+  const thisMonthTotal = salesRecords.filter((r) => r.date.startsWith(thisMonthPrefix)).reduce((s, r) => s + r.total, 0);
+  const thisMonthMargin = salesRecords.filter((r) => r.date.startsWith(thisMonthPrefix)).reduce((s, r) => s + getMargin(r), 0);
+  const lastMonthTotal = salesRecords.filter((r) => r.date.startsWith(lastMonthPrefix)).reduce((s, r) => s + r.total, 0);
+  const monthGrowthPct = lastMonthTotal > 0 ? ((thisMonthTotal - lastMonthTotal) / lastMonthTotal) * 100 : null;
+
+  // Tren 30 hari (omzet & laba per hari)
+  const trend = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const iso = d.toISOString().slice(0, 10);
+    const dayRecords = salesRecords.filter((r) => r.date === iso);
+    trend.push({ date: iso, omzet: dayRecords.reduce((s, r) => s + r.total, 0), laba: dayRecords.reduce((s, r) => s + getMargin(r), 0) });
+  }
+
+  const kerugianOnly = wasteLog.filter((w) => !(w.reason || '').startsWith('retur'));
+  const returOnly = wasteLog.filter((w) => (w.reason || '').startsWith('retur'));
+  const wasteThisMonth = kerugianOnly.filter((w) => w.date.startsWith(thisMonthPrefix)).reduce((s, w) => s + w.cost, 0);
+  const returThisMonth = returOnly.filter((w) => w.date.startsWith(thisMonthPrefix));
+  const returCostThisMonth = returThisMonth.reduce((s, w) => s + w.cost, 0);
+  const purchaseThisMonth = purchaseLog.filter((p) => p.date.startsWith(thisMonthPrefix)).reduce((s, p) => s + p.totalCost, 0);
+
+  const activePromos = promos.filter((p) => isPromoActive(p));
+
+  // Reminder komisi afiliator: cek minggu SEBELUM minggu berjalan (minggu yg sudah selesai)
+  const lastCompletedWeekStart = (() => {
+    const d = new Date(weekStartISO(today));
+    d.setDate(d.getDate() - 7);
+    return d.toISOString().slice(0, 10);
+  })();
+  const lastWeekEntries = affiliateSales.filter((e) => weekStartISO(e.date) === lastCompletedWeekStart);
+  const lastWeekCommission = lastWeekEntries.reduce((s, e) => s + e.commission, 0);
+  const lastWeekUnpaid = lastWeekCommission > 0 && !affiliatePayments.includes(lastCompletedWeekStart);
+
+  const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
+  const monthLabel = formatTargetPeriodLabel(t);
+
+  const lowRaw = rawMaterials.filter((m) => (m.minStock > 0 && m.currentStock <= m.minStock) || m.currentStock <= 0);
+  const lowBase = baseStock.filter((m) => (m.minStock > 0 && m.currentStock <= m.minStock) || m.currentStock <= 0);
+  const lowFinished = finishedStock.filter((m) => isMenuLow(m, rawMaterials, baseStock));
+  const lowItems = [
+    ...lowRaw.map((m) => ({ id: m.id, name: m.name, unit: m.unit, display: m.currentStock, group: 'Bahan Baku' })),
+    ...lowBase.map((m) => ({ id: m.id, name: m.name, unit: m.unit, display: m.currentStock, group: 'Base' })),
+    ...lowFinished.map((m) => ({
+      id: m.id, name: m.name,
+      unit: m.recipeBased ? (m.unit || 'porsi') : m.unit,
+      display: m.recipeBased ? computeMakeablePortions(m.recipe, rawMaterials, baseStock) : m.currentStock,
+      group: m.category || 'Menu Jadi',
+    })),
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <Card>
+          <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><TrendingUp className="w-3.5 h-3.5" /><span className="text-[11px]">Omzet hari ini</span></div>
+          <p className="font-display text-xl font-semibold" style={{ color: COLORS.text }}>{rupiah(todayTotal)}</p>
+          <p className="text-[11px] mt-0.5" style={{ color: COLORS.textMuted }}>{todayItems} item terjual</p>
+        </Card>
+        <Card>
+          <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><ChefHat className="w-3.5 h-3.5" /><span className="text-[11px]">Laba kotor hari ini</span></div>
+          <p className="font-display text-xl font-semibold" style={{ color: COLORS.secondary }}>{rupiah(todayMargin)}</p>
+          <p className="text-[11px] mt-0.5" style={{ color: COLORS.textMuted }}>Omzet − HPP bahan</p>
+        </Card>
+        <Card>
+          <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><Calendar className="w-3.5 h-3.5" /><span className="text-[11px]">Omzet 7 hari</span></div>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(weekTotal)}</p>
+          <GrowthBadge pct={weekGrowthPct} label="vs 7 hari lalu" />
+        </Card>
+        <Card>
+          <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><ChefHat className="w-3.5 h-3.5" /><span className="text-[11px]">Laba kotor 7 hari</span></div>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.secondary }}>{rupiah(weekMargin)}</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Akumulasi Bulan Ini · {monthLabel}</SectionLabel>
+        <div className="grid grid-cols-2 gap-3">
+          <Card>
+            <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><Wallet className="w-3.5 h-3.5" /><span className="text-[11px]">Omzet bulan ini</span></div>
+            <p className="font-display text-xl font-semibold" style={{ color: COLORS.text }}>{rupiah(thisMonthTotal)}</p>
+            <GrowthBadge pct={monthGrowthPct} label="vs bulan lalu" />
+          </Card>
+          <Card>
+            <div className="flex items-center gap-1.5 mb-1" style={{ color: COLORS.textMuted }}><ChefHat className="w-3.5 h-3.5" /><span className="text-[11px]">Laba kotor bulan ini</span></div>
+            <p className="font-display text-xl font-semibold" style={{ color: COLORS.secondary }}>{rupiah(thisMonthMargin)}</p>
+            <p className="text-[11px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
+          </Card>
+        </div>
+        <Card className="mt-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5" style={{ color: COLORS.textMuted }}><Truck className="w-3.5 h-3.5" /><span className="text-[11px]">Pengeluaran belanja bahan baku bulan ini</span></div>
+            <span className="font-display text-base font-semibold" style={{ color: COLORS.text }}>{rupiah(purchaseThisMonth)}</span>
+          </div>
+          <p className="text-[10px] mt-1" style={{ color: COLORS.textMuted }}>Uang keluar buat belanja — beda dari HPP (biaya bahan yang sudah terjual)</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Tren 30 Hari</SectionLabel>
+        <Card>
+          <TrendChart data={trend} />
+          <div className="flex items-center justify-center gap-4 mt-2">
+            <span className="flex items-center gap-1.5 text-[11px]" style={{ color: COLORS.textMuted }}><span className="w-2.5 h-2.5 rounded-full" style={{ background: COLORS.primary }} />Omzet</span>
+            <span className="flex items-center gap-1.5 text-[11px]" style={{ color: COLORS.textMuted }}><span className="w-2.5 h-2.5 rounded-full" style={{ background: COLORS.secondary }} />Laba Kotor</span>
+          </div>
+        </Card>
+      </div>
+
+      {wasteThisMonth > 0 && (
+        <div>
+          <SectionLabel>Kerugian Bulan Ini</SectionLabel>
+          <Card>
+            <div className="flex items-center justify-between">
+              <span className="text-sm" style={{ color: COLORS.textMuted }}>Total biaya bahan rusak/kadaluarsa/gagal produksi</span>
+              <span className="font-display text-base font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(wasteThisMonth)}</span>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {returThisMonth.length > 0 && (
+        <div>
+          <SectionLabel>Returan Bulan Ini</SectionLabel>
+          <Card>
+            <div className="flex items-center justify-between">
+              <span className="text-sm flex items-center gap-1.5" style={{ color: COLORS.textMuted }}><RotateCcw className="w-3.5 h-3.5" />{returThisMonth.length} kejadian retur</span>
+              <span className="font-display text-base font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(returCostThisMonth)}</span>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {activePromos.length > 0 && (
+        <div>
+          <SectionLabel>Promo Berjalan</SectionLabel>
+          <div className="space-y-2">
+            {activePromos.map((p) => (
+              <div key={p.id} className="flex items-center gap-3 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(122,154,87,0.08)', border: `1px solid ${COLORS.secondary}55` }}>
+                <Megaphone className="w-4 h-4 shrink-0" style={{ color: COLORS.secondary }} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{p.name}</p>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Sampai {fmtDate(p.endDate)}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {lastWeekUnpaid && (
+        <div>
+          <SectionLabel>Reminder</SectionLabel>
+          <div className="flex items-center gap-3 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(217,164,65,0.08)', border: `1px solid ${COLORS.warning}55` }}>
+            <Bell className="w-4 h-4 shrink-0" style={{ color: COLORS.warning }} />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium" style={{ color: COLORS.text }}>Komisi afiliator minggu lalu belum dibayar</p>
+              <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{weekRangeLabel(lastCompletedWeekStart)}</p>
+            </div>
+            <span className="font-display text-sm font-semibold shrink-0" style={{ color: COLORS.warning }}>{rupiah(lastWeekCommission)}</span>
+          </div>
+        </div>
+      )}
+
+      {Object.keys(todayByChannel).length > 0 && (
+        <div>
+          <SectionLabel>Omzet Hari Ini per Channel</SectionLabel>
+          <Card>
+            <div className="space-y-1.5">
+              {Object.entries(todayByChannel).map(([ch, val]) => (
+                <div key={ch} className="flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><Store className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />{ch}</span>
+                  <span className="font-display font-semibold" style={{ color: COLORS.secondary }}>{rupiah(val)}</span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </div>
+      )}
+
+      <div>
+        <SectionLabel>Target Penjualan Bulan Ini · {monthLabel}</SectionLabel>
+        <Card>
+          {t.targetBulanan <= 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada data karyawan/buffer — atur di tab Target.</p>
+          ) : (
+            <>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs" style={{ color: COLORS.textMuted }}>Realisasi: {rupiah(t.realisasi)} / {rupiah(t.targetBulanan)}</span>
+                <span className="text-sm font-display font-semibold" style={{ color: COLORS.secondary }}>{t.progressPercent.toFixed(0)}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: COLORS.surfaceLight }}>
+                <div className="h-full rounded-full" style={{ width: `${Math.min(100, t.progressPercent)}%`, background: COLORS.secondary }} />
+              </div>
+              <p className="text-[11px] mt-2" style={{ color: t.paceDiff >= 0 ? COLORS.secondary : COLORS.warning }}>
+                {t.paceDiff >= 0 ? `Di atas jalur +${rupiah(t.paceDiff)}` : `Di bawah jalur −${rupiah(Math.abs(t.paceDiff))}`} dari target harian rata-rata (hari ke-{t.dayOfMonth}/{t.daysInMonth})
+              </p>
+            </>
+          )}
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Peringatan Stok</SectionLabel>
+        {lowItems.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Semua stok masih aman. Belum ada yang menipis.</p></Card>
+        ) : (
+          <div className="space-y-2">
+            {lowItems.map((m) => (
+              <div key={m.group + m.id} className="flex items-center gap-3 rounded-xl px-3.5 py-2.5" style={{ background: 'rgba(217,164,65,0.08)', border: `1px solid ${COLORS.warning}55` }}>
+                <AlertTriangle className="w-4 h-4 shrink-0" style={{ color: COLORS.warning }} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{m.name}</p>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{m.group}</p>
+                </div>
+                <p className="text-sm font-semibold shrink-0" style={{ color: COLORS.warning }}>{m.display} {m.unit || ''}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- STOK TAB (3 tingkat: Bahan Baku / Base / Menu Jadi) ---------------- */
+function StokTab({ rawMaterials, baseStock, finishedStock, salesRecords, productionLog, wasteLog, onSaveRaw, onSaveBase, onSaveFinished, onSaveProductionLog, onSaveWasteLog }) {
+  const [sub, setSub] = useState('bahan');
+  const [form, setForm] = useState(null);
+  const [categoryFilter, setCategoryFilter] = useState('Semua');
+  const [sortMode, setSortMode] = useState('manual');
+  const [producing, setProducing] = useState(null); // { itemId, batches }
+  const [wasteForm, setWasteForm] = useState(null); // { itemId, mode: 'kerugian'|'retur', qty, reason, kondisi, notes }
+  const [opnameMode, setOpnameMode] = useState(false);
+  const [opnameInputs, setOpnameInputs] = useState({}); // { itemId: physicalQty }
+
+  const subMeta = {
+    bahan: { list: rawMaterials, onSave: onSaveRaw },
+    base: { list: baseStock, onSave: onSaveBase },
+    pizza: { list: finishedStock, onSave: onSaveFinished },
+  };
+  const { list, onSave } = subMeta[sub];
+  const displayedList = sub !== 'pizza' || categoryFilter === 'Semua' ? list : list.filter((i) => (i.category || 'Lainnya') === categoryFilter);
+
+  const sortedList = sub === 'pizza' && sortMode !== 'manual'
+    ? [...displayedList].sort((a, b) => {
+        if (sortMode === 'margin') {
+          return ((b.sellingPrice || 0) - menuHpp(b, rawMaterials, baseStock)) - ((a.sellingPrice || 0) - menuHpp(a, rawMaterials, baseStock));
+        }
+        if (sortMode === 'terlaris') {
+          return computeMonthlySold(b.name, salesRecords) - computeMonthlySold(a.name, salesRecords);
+        }
+        if (sortMode === 'kontribusi') {
+          const contribA = ((a.sellingPrice || 0) - menuHpp(a, rawMaterials, baseStock)) * computeMonthlySold(a.name, salesRecords);
+          const contribB = ((b.sellingPrice || 0) - menuHpp(b, rawMaterials, baseStock)) * computeMonthlySold(b.name, salesRecords);
+          return contribB - contribA;
+        }
+        if (sortMode === 'az') return a.name.localeCompare(b.name);
+        return 0;
+      })
+    : displayedList;
+
+  const openNew = () => {
+    if (sub === 'bahan') setForm({ editingId: null, name: '', unit: 'kg', currentStock: '', minStock: '', purchasePrice: '' });
+    else if (sub === 'base') setForm({ editingId: null, name: '', unit: 'pcs', currentStock: '', minStock: '', yieldQty: '1', recipe: [] });
+    else setForm({ editingId: null, name: '', unit: 'pcs', category: CATEGORIES[0] || 'Lainnya', sellingPrice: '', recipeBased: false, recipe: [], currentStock: '', minStock: '', purchasePrice: '' });
+  };
+
+  const openEdit = (item) => {
+    if (sub === 'bahan') {
+      setForm({ editingId: item.id, name: item.name, unit: item.unit, currentStock: String(item.currentStock), minStock: String(item.minStock), purchasePrice: String(item.purchasePrice || '') });
+    } else if (sub === 'base') {
+      setForm({
+        editingId: item.id, name: item.name, unit: item.unit, currentStock: String(item.currentStock), minStock: String(item.minStock),
+        yieldQty: String(item.yieldQty || 1),
+        recipe: (item.recipe || []).map((r) => ({ rowId: genId(), rawMaterialId: ingSourceId(r), qty: String(r.qty) })),
+      });
+    } else {
+      setForm({
+        editingId: item.id, name: item.name, unit: item.unit, category: item.category || 'Lainnya', sellingPrice: String(item.sellingPrice || ''),
+        recipeBased: !!item.recipeBased,
+        recipe: (item.recipe || []).map((r) => ({ rowId: genId(), sourceType: ingSourceType(r), sourceId: ingSourceId(r), qty: String(r.qty) })),
+        currentStock: String(item.currentStock || ''), minStock: String(item.minStock || ''), purchasePrice: String(item.purchasePrice || ''),
+      });
+    }
+  };
+
+  const submitForm = () => {
+    if (!form.name.trim()) return;
+    let payload;
+    if (sub === 'bahan') {
+      payload = { id: form.editingId || genId(), name: form.name.trim(), unit: form.unit.trim() || 'kg', currentStock: parseFloat(form.currentStock) || 0, minStock: parseFloat(form.minStock) || 0, purchasePrice: parseFloat(form.purchasePrice) || 0 };
+    } else if (sub === 'base') {
+      payload = {
+        id: form.editingId || genId(), name: form.name.trim(), unit: form.unit.trim() || 'pcs',
+        currentStock: parseFloat(form.currentStock) || 0, minStock: parseFloat(form.minStock) || 0,
+        yieldQty: parseFloat(form.yieldQty) || 1,
+        recipe: form.recipe.filter((r) => r.rawMaterialId && parseFloat(r.qty) > 0).map((r) => ({ rawMaterialId: r.rawMaterialId, qty: parseFloat(r.qty) || 0 })),
+      };
+    } else {
+      const base = { id: form.editingId || genId(), name: form.name.trim(), unit: form.unit.trim() || 'pcs', category: form.category || 'Lainnya', sellingPrice: parseFloat(form.sellingPrice) || 0 };
+      if (form.recipeBased) {
+        payload = {
+          ...base, recipeBased: true,
+          recipe: form.recipe.filter((r) => r.sourceId && parseFloat(r.qty) > 0).map((r) => ({ sourceType: r.sourceType || 'raw', sourceId: r.sourceId, qty: parseFloat(r.qty) || 0 })),
+          minStock: parseFloat(form.minStock) || 0,
+        };
+      } else {
+        payload = { ...base, recipeBased: false, currentStock: parseFloat(form.currentStock) || 0, minStock: parseFloat(form.minStock) || 0, purchasePrice: parseFloat(form.purchasePrice) || 0 };
+      }
+    }
+    onSave(form.editingId ? list.map((i) => (i.id === form.editingId ? payload : i)) : [...list, payload]);
+    setForm(null);
+  };
+
+  const adjust = (item, delta) => {
+    const next = Math.max(0, item.currentStock + delta);
+    onSave(list.map((i) => (i.id === item.id ? { ...i, currentStock: next } : i)));
+  };
+  const remove = (id) => onSave(list.filter((i) => i.id !== id));
+
+  const moveItem = (filteredIndex, direction) => {
+    const targetFilteredIndex = filteredIndex + direction;
+    if (targetFilteredIndex < 0 || targetFilteredIndex >= displayedList.length) return;
+    const movingItem = displayedList[filteredIndex];
+    const targetItem = displayedList[targetFilteredIndex];
+    const withoutMoving = list.filter((i) => i.id !== movingItem.id);
+    const targetPos = withoutMoving.findIndex((i) => i.id === targetItem.id);
+    const insertAt = direction < 0 ? targetPos : targetPos + 1;
+    onSave([...withoutMoving.slice(0, insertAt), movingItem, ...withoutMoving.slice(insertAt)]);
+  };
+
+  // --- recipe row helpers (dipakai form Base: raw-only, & form Menu Jadi: raw+base) ---
+  const addBaseRecipeRow = () => setForm({ ...form, recipe: [...form.recipe, { rowId: genId(), rawMaterialId: '', qty: '' }] });
+  const updateBaseRecipeRow = (rowId, field, value) => setForm({ ...form, recipe: form.recipe.map((r) => (r.rowId === rowId ? { ...r, [field]: value } : r)) });
+  const removeBaseRecipeRow = (rowId) => setForm({ ...form, recipe: form.recipe.filter((r) => r.rowId !== rowId) });
+
+  const addMenuRecipeRow = () => setForm({ ...form, recipe: [...form.recipe, { rowId: genId(), sourceType: 'raw', sourceId: '', qty: '' }] });
+  const updateMenuRecipeRow = (rowId, field, value) => setForm({
+    ...form,
+    recipe: form.recipe.map((r) => (r.rowId === rowId ? (field === 'sourceType' ? { ...r, sourceType: value, sourceId: '' } : { ...r, [field]: value }) : r)),
+  });
+  const removeMenuRecipeRow = (rowId) => setForm({ ...form, recipe: form.recipe.filter((r) => r.rowId !== rowId) });
+
+  const previewBaseBatchCost = sub === 'base' && form ? form.recipe.reduce((s, r) => { const rm = rawMaterials.find((x) => x.id === r.rawMaterialId); return s + (parseFloat(r.qty) || 0) * (rm ? rm.purchasePrice || 0 : 0); }, 0) : 0;
+  const previewBaseUnitCost = sub === 'base' && form ? previewBaseBatchCost / (parseFloat(form.yieldQty) || 1) : 0;
+
+  const previewMenuHpp = sub === 'pizza' && form
+    ? computeRecipeHpp(form.recipe.filter((r) => r.sourceId).map((r) => ({ sourceType: r.sourceType, sourceId: r.sourceId, qty: parseFloat(r.qty) || 0 })), rawMaterials, baseStock)
+    : 0;
+  const previewSell = form ? parseFloat(form.sellingPrice) || 0 : 0;
+
+  // --- produksi batch base ---
+  const startProduce = (item) => setProducing({ itemId: item.id, batches: '1' });
+  const confirmProduce = () => {
+    const item = baseStock.find((b) => b.id === producing.itemId);
+    const batches = parseFloat(producing.batches) || 0;
+    if (!item || batches <= 0) return;
+    const nextRaw = rawMaterials.map((rm) => {
+      const ing = (item.recipe || []).find((r) => ingSourceId(r) === rm.id);
+      if (!ing) return rm;
+      return { ...rm, currentStock: Math.max(0, rm.currentStock - ing.qty * batches) };
+    });
+    onSaveRaw(nextRaw);
+    const unitsProduced = (item.yieldQty || 1) * batches;
+    onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: b.currentStock + unitsProduced } : b)));
+    onSaveProductionLog([...productionLog, { id: genId(), baseId: item.id, date: todayISO(), batches, unitsProduced }]);
+    setProducing(null);
+  };
+
+  // --- kerugian langsung (retur pindah ke halaman Returan tersendiri) ---
+  const logWaste = (entry) => onSaveWasteLog([...wasteLog, { id: genId(), date: todayISO(), ...entry }]);
+
+  const submitWasteForm = () => {
+    const item = finishedStock.find((i) => i.id === wasteForm.itemId) || baseStock.find((i) => i.id === wasteForm.itemId) || rawMaterials.find((i) => i.id === wasteForm.itemId);
+    const qty = parseFloat(wasteForm.qty) || 0;
+    if (!item || qty <= 0) return;
+    const sourceType = sub;
+    let cost = 0;
+    if (sourceType === 'pizza') {
+      cost = qty * menuHpp(item, rawMaterials, baseStock);
+      if (item.recipeBased) applyRecipeDeltaGlobal(item.recipe, qty, rawMaterials, baseStock, onSaveRaw, onSaveBase);
+      else onSaveFinished(finishedStock.map((f) => (f.id === item.id ? { ...f, currentStock: Math.max(0, f.currentStock - qty) } : f)));
+    } else if (sourceType === 'base') {
+      cost = qty * computeBaseUnitCost(item, rawMaterials);
+      onSaveBase(baseStock.map((b) => (b.id === item.id ? { ...b, currentStock: Math.max(0, b.currentStock - qty) } : b)));
+    } else {
+      cost = qty * (item.purchasePrice || 0);
+      onSaveRaw(rawMaterials.map((r) => (r.id === item.id ? { ...r, currentStock: Math.max(0, r.currentStock - qty) } : r)));
+    }
+    logWaste({ sourceType, sourceId: item.id, sourceName: item.name, qty, unit: item.unit, cost, reason: wasteForm.reason, notes: wasteForm.notes.trim() });
+    setWasteForm(null);
+  };
+
+  // --- stock opname ---
+  const applyOpname = () => {
+    const entries = Object.entries(opnameInputs).filter(([, v]) => v !== '' && v !== undefined);
+    if (entries.length === 0) return;
+    let nextList = list;
+    entries.forEach(([itemId, physicalStr]) => {
+      const item = nextList.find((i) => i.id === itemId);
+      if (!item) return;
+      const physical = parseFloat(physicalStr) || 0;
+      const delta = item.currentStock - physical; // positif = kekurangan (hilang)
+      nextList = nextList.map((i) => (i.id === itemId ? { ...i, currentStock: physical } : i));
+      if (delta !== 0) {
+        const unitCost = sub === 'base' ? computeBaseUnitCost(item, rawMaterials) : (item.purchasePrice || 0);
+        logWaste({ sourceType: sub, sourceId: item.id, sourceName: item.name, qty: Math.abs(delta), unit: item.unit, cost: delta > 0 ? delta * unitCost : 0, reason: 'opname', notes: delta > 0 ? `Stok sistem lebih banyak dari fisik (kurang ${delta} ${item.unit})` : `Stok fisik lebih banyak dari sistem (lebih ${-delta} ${item.unit})` });
+      }
+    });
+    onSave(nextList);
+    setOpnameInputs({});
+    setOpnameMode(false);
+  };
+
+  const SUB_TABS = [{ id: 'bahan', label: 'Bahan Baku' }, { id: 'base', label: 'Base' }, { id: 'pizza', label: 'Menu Jadi' }];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {SUB_TABS.map((t) => (
+          <button key={t.id} onClick={() => { setSub(t.id); setForm(null); setProducing(null); }} className="flex-1 py-2 rounded-lg text-xs font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {sub === 'pizza' && (
+        <div className="flex gap-1.5 overflow-x-auto pb-0.5">
+          {['Semua', ...CATEGORIES].map((c) => (
+            <button key={c} onClick={() => setCategoryFilter(c)} className="px-3 py-1.5 rounded-full text-xs font-medium shrink-0" style={categoryFilter === c ? { background: COLORS.secondary, color: COLORS.bg } : { background: COLORS.surface, color: COLORS.textMuted, border: `1px solid ${COLORS.border}` }}>
+              {c}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {sub === 'pizza' && (
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] shrink-0" style={{ color: COLORS.textMuted }}>Urutkan:</span>
+          <select value={sortMode} onChange={(e) => setSortMode(e.target.value)} className="flex-1 rounded-lg px-2 py-1.5 text-xs border" style={{ background: COLORS.surface, borderColor: COLORS.border, color: COLORS.text }}>
+            <option value="manual" style={{ background: COLORS.surface }}>Manual (atur sendiri)</option>
+            <option value="margin" style={{ background: COLORS.surface }}>Margin per unit tertinggi</option>
+            <option value="terlaris" style={{ background: COLORS.surface }}>Terlaris bulan ini</option>
+            <option value="kontribusi" style={{ background: COLORS.surface }}>Kontribusi laba tertinggi</option>
+            <option value="az" style={{ background: COLORS.surface }}>Nama A-Z</option>
+          </select>
+        </div>
+      )}
+
+      {(sub === 'bahan' || sub === 'base') && (
+        <button onClick={() => { setOpnameMode(!opnameMode); setOpnameInputs({}); }} className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-medium" style={{ background: opnameMode ? COLORS.warning : COLORS.surface, color: opnameMode ? COLORS.bg : COLORS.textMuted, border: `1px solid ${COLORS.border}` }}>
+          <ClipboardList className="w-3.5 h-3.5" /> {opnameMode ? 'Batal Stock Opname' : 'Mode Stock Opname'}
+        </button>
+      )}
+      {opnameMode && (sub === 'bahan' || sub === 'base') && (
+        <p className="text-[11px] px-1" style={{ color: COLORS.textMuted }}>Isi kolom "Fisik" untuk item yang stoknya beda dari hitungan sistem, lalu tekan Terapkan di bawah. Item yang tidak diisi tidak akan berubah.</p>
+      )}
+
+      {displayedList.length === 0 && !form && (
+        <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada {sub === 'bahan' ? 'bahan baku' : sub === 'base' ? 'base' : 'menu'} yang dicatat. Tambahkan item pertama.</p></Card>
+      )}
+
+      <div className="space-y-2">
+        {(sub === 'pizza' ? sortedList : displayedList).map((item, idx) => {
+          if (sub === 'bahan') {
+            const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
+            const isWasteThis = wasteForm && wasteForm.itemId === item.id;
+            return (
+              <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{item.name}</p>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Beli: {rupiah(item.purchasePrice)}/{item.unit}{item.minStock > 0 ? ` · Min. ${item.minStock} ${item.unit}` : ''}</p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {!opnameMode && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
+                    <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+                  </div>
+                </div>
+                {opnameMode ? (
+                  <div className="flex items-center gap-2 mt-2.5">
+                    <span className="text-xs" style={{ color: COLORS.textMuted }}>Sistem: {item.currentStock} {item.unit} → Fisik:</span>
+                    <input type="number" value={opnameInputs[item.id] ?? ''} onChange={(e) => setOpnameInputs({ ...opnameInputs, [item.id]: e.target.value })} placeholder={String(item.currentStock)} className="w-24 rounded-lg px-2 py-1 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between mt-2.5">
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
+                      <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
+                      <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                    </div>
+                    {low && <AlertTriangle className="w-4 h-4" style={{ color: COLORS.warning }} />}
+                  </div>
+                )}
+                {isWasteThis && <WasteFormPanel item={item} sub={sub} wasteForm={wasteForm} setWasteForm={setWasteForm} onCancel={() => setWasteForm(null)} onSubmit={submitWasteForm} rawMaterials={rawMaterials} baseStock={baseStock} />}
+              </div>
+            );
+          }
+
+          if (sub === 'base') {
+            const low = (item.minStock > 0 && item.currentStock <= item.minStock) || item.currentStock <= 0;
+            const unitCost = computeBaseUnitCost(item, rawMaterials);
+            const isProducingThis = producing && producing.itemId === item.id;
+            const isWasteThis = wasteForm && wasteForm.itemId === item.id;
+            const prodStats = computeBaseProductionStats(item.id, productionLog);
+            return (
+              <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{item.name}</p>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Biaya: {rupiah(unitCost)}/{item.unit} · Hasil {item.yieldQty || 1} {item.unit}/resep</p>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Produksi bulan ini: <span style={{ color: COLORS.text }}>{prodStats.thisMonth} {item.unit}</span> · Rata-rata/bulan: <span style={{ color: COLORS.text }}>{prodStats.avgPerMonth.toFixed(1)} {item.unit}</span></p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {!opnameMode && <ReorderButtons index={idx} total={list.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                    {!opnameMode && <button onClick={() => setWasteForm({ itemId: item.id, qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>}
+                    <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+                  </div>
+                </div>
+                {opnameMode ? (
+                  <div className="flex items-center gap-2 mt-2.5">
+                    <span className="text-xs" style={{ color: COLORS.textMuted }}>Sistem: {item.currentStock} {item.unit} → Fisik:</span>
+                    <input type="number" value={opnameInputs[item.id] ?? ''} onChange={(e) => setOpnameInputs({ ...opnameInputs, [item.id]: e.target.value })} placeholder={String(item.currentStock)} className="w-24 rounded-lg px-2 py-1 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between mt-2.5">
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
+                      <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
+                      <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                    </div>
+                    <button onClick={() => startProduce(item)} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium" style={{ background: COLORS.secondary, color: COLORS.bg }}><Factory className="w-3.5 h-3.5" /> Produksi</button>
+                  </div>
+                )}
+                {isWasteThis && <WasteFormPanel item={item} sub={sub} wasteForm={wasteForm} setWasteForm={setWasteForm} onCancel={() => setWasteForm(null)} onSubmit={submitWasteForm} rawMaterials={rawMaterials} baseStock={baseStock} />}
+                {isProducingThis && (
+                  <div className="mt-3 pt-3 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                    <div className="flex items-center gap-2">
+                      <Field label="Jumlah resep/batch">
+                        <input type="number" value={producing.batches} onChange={(e) => setProducing({ ...producing, batches: e.target.value })} className="w-full bg-transparent outline-none text-sm py-1.5" style={{ color: COLORS.text }} />
+                      </Field>
+                    </div>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                      Menghasilkan {(item.yieldQty || 1) * (parseFloat(producing.batches) || 0)} {item.unit}. Bahan yang dipakai:{' '}
+                      {(item.recipe || []).map((ing) => {
+                        const rm = rawMaterials.find((r) => r.id === ingSourceId(ing));
+                        return rm ? `${rm.name} ${(ing.qty * (parseFloat(producing.batches) || 0))}${rm.unit}` : null;
+                      }).filter(Boolean).join(', ')}
+                    </p>
+                    <div className="flex gap-2">
+                      <button onClick={() => setProducing(null)} className="flex-1 py-2 rounded-lg text-xs" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+                      <button onClick={confirmProduce} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Konfirmasi Produksi</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          // sub === 'pizza'
+          const low = isMenuLow(item, rawMaterials, baseStock);
+          const makeable = item.recipeBased ? computeMakeablePortions(item.recipe, rawMaterials, baseStock) : null;
+          const hpp = menuHpp(item, rawMaterials, baseStock);
+          const margin = (item.sellingPrice || 0) - hpp;
+          const monthlySold = computeMonthlySold(item.name, salesRecords);
+          const isWasteThis = wasteForm && wasteForm.itemId === item.id;
+          return (
+            <div key={item.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${low ? COLORS.warning + '66' : COLORS.border}` }}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{item.name}</p>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>{item.category || 'Lainnya'}</span>
+                    {item.recipeBased && <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 flex items-center gap-0.5" style={{ background: COLORS.surfaceLight, color: COLORS.secondary }}><ChefHat className="w-2.5 h-2.5" /> Resep</span>}
+                  </div>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>
+                    Jual: {rupiah(item.sellingPrice)} · HPP: {rupiah(hpp)} · <span style={{ color: margin >= 0 ? COLORS.secondary : COLORS.primaryLight }}>Margin: {rupiah(margin)}</span>
+                  </p>
+                  <p className="text-[11px]" style={{ color: COLORS.textMuted }}>Terjual bulan ini: <span style={{ color: COLORS.text }}>{monthlySold} {item.unit}</span></p>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {sortMode === 'manual' && <ReorderButtons index={idx} total={displayedList.length} onMoveUp={() => moveItem(idx, -1)} onMoveDown={() => moveItem(idx, 1)} />}
+                  <button onClick={() => setWasteForm({ itemId: item.id, qty: '', reason: 'rusak', notes: '' })} className="p-1.5 rounded-md" style={{ color: COLORS.warning }}><PackageX className="w-3.5 h-3.5" /></button>
+                  <button onClick={() => openEdit(item)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                  <button onClick={() => remove(item.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+                </div>
+              </div>
+              {!item.recipeBased ? (
+                <div className="flex items-center justify-between mt-2.5">
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => adjust(item, -1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Minus className="w-3.5 h-3.5" /></button>
+                    <span className="text-base font-semibold w-16 text-center font-display" style={{ color: low ? COLORS.warning : COLORS.text }}>{item.currentStock} {item.unit}</span>
+                    <button onClick={() => adjust(item, 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: COLORS.surfaceLight, color: COLORS.text }}><Plus className="w-3.5 h-3.5" /></button>
+                  </div>
+                  {low && <AlertTriangle className="w-4 h-4" style={{ color: COLORS.warning }} />}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between mt-2.5">
+                  <span className="text-sm" style={{ color: COLORS.textMuted }}>Bisa dibuat: <span className="font-display font-semibold" style={{ color: low ? COLORS.warning : COLORS.text }}>{makeable} {item.unit || 'porsi'}</span></span>
+                  {low && <AlertTriangle className="w-4 h-4" style={{ color: COLORS.warning }} />}
+                </div>
+              )}
+              {isWasteThis && <WasteFormPanel item={item} sub={sub} wasteForm={wasteForm} setWasteForm={setWasteForm} onCancel={() => setWasteForm(null)} onSubmit={submitWasteForm} rawMaterials={rawMaterials} baseStock={baseStock} />}
+            </div>
+          );
+        })}
+      </div>
+
+      {opnameMode && (
+        <button onClick={applyOpname} className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5" style={{ background: COLORS.warning, color: COLORS.bg }}>
+          <ClipboardList className="w-4 h-4" /> Terapkan Hasil Opname
+        </button>
+      )}
+
+      {!form && !opnameMode && (
+        <button onClick={openNew} className="w-full py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+          <Plus className="w-4 h-4" /> Tambah {sub === 'bahan' ? 'Bahan Baku' : sub === 'base' ? 'Base' : 'Menu'}
+        </button>
+      )}
+
+      {form && (
+        <Card>
+          <SectionLabel>{form.editingId ? 'Edit Item' : 'Item Baru'}</SectionLabel>
+          <div className="space-y-2.5">
+            <Field label="Nama">
+              <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder={sub === 'bahan' ? 'Contoh: Nama Bahan' : sub === 'base' ? 'Contoh: Adonan Dasar' : 'Contoh: Nama Menu/Produk'} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+            </Field>
+
+            {sub === 'pizza' && (
+              <Field label="Kategori">
+                <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                  {CATEGORIES.map((c) => <option key={c} value={c} style={{ background: COLORS.surface }}>{c}</option>)}
+                </select>
+              </Field>
+            )}
+
+            <Field label="Satuan">
+              <input value={form.unit} onChange={(e) => setForm({ ...form, unit: e.target.value })} placeholder={sub === 'bahan' ? 'gram / ml / pcs' : 'pcs / porsi'} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+            </Field>
+            {sub === 'bahan' && <p className="text-[10px] px-1 -mt-1.5" style={{ color: COLORS.textMuted }}>Pakai satuan sekecil mungkin (mis. gram) kalau bahan ini dipakai di resep Base — supaya presisi tanpa konversi.</p>}
+
+            {sub === 'bahan' && (
+              <div className="grid grid-cols-3 gap-2.5">
+                <Field label="Stok Saat Ini"><input type="number" value={form.currentStock} onChange={(e) => setForm({ ...form, currentStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                <Field label="Stok Minimum"><input type="number" value={form.minStock} onChange={(e) => setForm({ ...form, minStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                <Field label="Harga Beli"><input type="number" value={form.purchasePrice} onChange={(e) => setForm({ ...form, purchasePrice: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+              </div>
+            )}
+
+            {sub === 'base' && (
+              <>
+                <div className="grid grid-cols-3 gap-2.5">
+                  <Field label="Stok Saat Ini"><input type="number" value={form.currentStock} onChange={(e) => setForm({ ...form, currentStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                  <Field label="Stok Minimum"><input type="number" value={form.minStock} onChange={(e) => setForm({ ...form, minStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                  <Field label="Hasil/Resep"><input type="number" value={form.yieldQty} onChange={(e) => setForm({ ...form, yieldQty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                </div>
+                <SectionLabel>Resep (dari Bahan Baku)</SectionLabel>
+                <div className="space-y-2">
+                  {form.recipe.length === 0 && <p className="text-xs px-1" style={{ color: COLORS.textMuted }}>Belum ada bahan di resep ini.</p>}
+                  {form.recipe.map((row) => (
+                    <div key={row.rowId} className="flex items-center gap-2">
+                      <select value={row.rawMaterialId} onChange={(e) => updateBaseRecipeRow(row.rowId, 'rawMaterialId', e.target.value)} className="flex-1 min-w-0 rounded-lg px-2 py-2 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }}>
+                        <option value="" style={{ background: COLORS.surface }}>Pilih bahan baku</option>
+                        {rawMaterials.map((rm) => <option key={rm.id} value={rm.id} style={{ background: COLORS.surface }}>{rm.name} ({rm.unit})</option>)}
+                      </select>
+                      <input type="number" value={row.qty} onChange={(e) => updateBaseRecipeRow(row.rowId, 'qty', e.target.value)} placeholder="Qty" className="w-20 rounded-lg px-2 py-2 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+                      <button onClick={() => removeBaseRecipeRow(row.rowId)} style={{ color: COLORS.textMuted }}><X className="w-4 h-4" /></button>
+                    </div>
+                  ))}
+                </div>
+                {rawMaterials.length === 0 && <p className="text-xs px-1" style={{ color: COLORS.warning }}>Belum ada bahan baku — tambahkan dulu di tab Bahan Baku.</p>}
+                <button onClick={addBaseRecipeRow} className="w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}><Plus className="w-3.5 h-3.5" /> Tambah Bahan</button>
+                <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <span style={{ color: COLORS.textMuted }}>Biaya total/resep: {rupiah(previewBaseBatchCost)}</span>
+                  <span style={{ color: COLORS.text }}>Biaya/{form.unit || 'pcs'}: {rupiah(previewBaseUnitCost)}</span>
+                </div>
+              </>
+            )}
+
+            {sub === 'pizza' && (
+              <>
+                <Field label="Harga Jual"><input type="number" value={form.sellingPrice} onChange={(e) => setForm({ ...form, sellingPrice: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                <button type="button" onClick={() => setForm({ ...form, recipeBased: !form.recipeBased })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: form.recipeBased ? 'rgba(122,154,87,0.12)' : COLORS.bg }}>
+                  <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><ChefHat className="w-4 h-4" /> Item ini dibuat dari resep</span>
+                  <span className="w-9 h-5 rounded-full relative transition-colors" style={{ background: form.recipeBased ? COLORS.secondary : COLORS.border }}>
+                    <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: form.recipeBased ? '18px' : '2px' }} />
+                  </span>
+                </button>
+
+                {form.recipeBased ? (
+                  <>
+                    <div className="space-y-2">
+                      {form.recipe.length === 0 && <p className="text-xs px-1" style={{ color: COLORS.textMuted }}>Belum ada bahan di resep ini.</p>}
+                      {form.recipe.map((row) => {
+                        const options = row.sourceType === 'base' ? baseStock : rawMaterials;
+                        return (
+                          <div key={row.rowId} className="rounded-lg p-2 border space-y-1.5" style={{ borderColor: COLORS.border, background: COLORS.bg }}>
+                            <div className="flex items-center gap-2">
+                              <select value={row.sourceType} onChange={(e) => updateMenuRecipeRow(row.rowId, 'sourceType', e.target.value)} className="rounded-lg px-2 py-1.5 text-xs border shrink-0" style={{ background: COLORS.surface, borderColor: COLORS.border, color: COLORS.text }}>
+                                <option value="raw">Bahan Baku</option>
+                                <option value="base">Base</option>
+                              </select>
+                              <select value={row.sourceId} onChange={(e) => updateMenuRecipeRow(row.rowId, 'sourceId', e.target.value)} className="flex-1 min-w-0 rounded-lg px-2 py-1.5 text-xs border" style={{ background: COLORS.surface, borderColor: COLORS.border, color: COLORS.text }}>
+                                <option value="" style={{ background: COLORS.surface }}>Pilih item</option>
+                                {options.map((o) => <option key={o.id} value={o.id} style={{ background: COLORS.surface }}>{o.name} ({o.unit})</option>)}
+                              </select>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <input type="number" value={row.qty} onChange={(e) => updateMenuRecipeRow(row.rowId, 'qty', e.target.value)} placeholder="Qty" className="flex-1 rounded-lg px-2 py-1.5 text-xs border" style={{ background: COLORS.surface, borderColor: COLORS.border, color: COLORS.text }} />
+                              <button onClick={() => removeMenuRecipeRow(row.rowId)} style={{ color: COLORS.textMuted }}><X className="w-4 h-4" /></button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <button onClick={addMenuRecipeRow} className="w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}><Plus className="w-3.5 h-3.5" /> Tambah Bahan</button>
+                    <Field label="Stok Minimum (porsi, untuk alert)"><input type="number" value={form.minStock} onChange={(e) => setForm({ ...form, minStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                    <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                      <span style={{ color: COLORS.textMuted }}>HPP per porsi: {rupiah(previewMenuHpp)}</span>
+                      <span style={{ color: previewSell - previewMenuHpp >= 0 ? COLORS.secondary : COLORS.primaryLight }}>Margin: {rupiah(previewSell - previewMenuHpp)}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-3 gap-2.5">
+                      <Field label="Stok Saat Ini"><input type="number" value={form.currentStock} onChange={(e) => setForm({ ...form, currentStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                      <Field label="Stok Minimum"><input type="number" value={form.minStock} onChange={(e) => setForm({ ...form, minStock: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                      <Field label="Harga Beli"><input type="number" value={form.purchasePrice} onChange={(e) => setForm({ ...form, purchasePrice: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+                    </div>
+                    <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                      <span style={{ color: COLORS.textMuted }}>HPP: {rupiah(parseFloat(form.purchasePrice) || 0)}</span>
+                      <span style={{ color: previewSell - (parseFloat(form.purchasePrice) || 0) >= 0 ? COLORS.secondary : COLORS.primaryLight }}>Margin: {rupiah(previewSell - (parseFloat(form.purchasePrice) || 0))}</span>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+          <div className="flex gap-2 mt-3.5">
+            <button onClick={() => setForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+            <button onClick={submitForm} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- PENJUALAN TAB ---------------- */
+function IncomingOrdersPanel({ orders, onConfirm, onReject }) {
+  const [busyId, setBusyId] = useState(null);
+  if (!orders || orders.length === 0) return null;
+
+  const handle = async (fn, order) => {
+    setBusyId(order.id);
+    try {
+      await fn(order);
+    } catch (e) {
+      console.error(e);
+      alert('Gagal memproses pesanan, coba lagi.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <Card className="border-2" style={{ borderColor: COLORS.warning }}>
+      <SectionLabel>🛎️ Pesanan Masuk dari Website ({orders.length})</SectionLabel>
+      <div className="space-y-2.5">
+        {orders.map((o) => {
+          const items = o.items || [];
+          const busy = busyId === o.id;
+          return (
+            <div key={o.id} className="rounded-xl px-3 py-2.5" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+              <div className="flex items-start justify-between gap-2 mb-1.5">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{o.customerName || 'Tanpa nama'}</p>
+                  {o.customerAddress && <p className="text-[11px] truncate" style={{ color: COLORS.textMuted }}>{o.customerAddress}</p>}
+                </div>
+                <span className="text-sm font-display font-semibold shrink-0" style={{ color: COLORS.text }}>{rupiah(o.total)}</span>
+              </div>
+              <div className="space-y-0.5 mb-2">
+                {items.map((i, idx) => (
+                  <p key={idx} className="text-[11px]" style={{ color: COLORS.textMuted }}>{i.qty}× {i.name} {i.size ? `(${i.size})` : ''}</p>
+                ))}
+              </div>
+              <p className="text-[10px] mb-2" style={{ color: COLORS.textMuted }}>Bayar: {o.paymentMethod || '-'}{o.deliveryTime ? ` · Kirim: ${o.deliveryTime}` : ''}</p>
+              <div className="flex gap-2">
+                <button disabled={busy} onClick={() => handle(onReject, o)} className="flex-1 py-2 rounded-lg text-xs font-medium disabled:opacity-50" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Tolak</button>
+                <button disabled={busy} onClick={() => handle(onConfirm, o)} className="flex-1 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.text }}>
+                  {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} Konfirmasi
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function DeliveryTrackingPanel({ orders, onAdvance }) {
+  const [busyId, setBusyId] = useState(null);
+  if (!orders || orders.length === 0) return null;
+
+  const STAGES = [{ id: 'disiapkan', label: 'Disiapkan' }, { id: 'dikirim', label: 'Dikirim' }, { id: 'terkirim', label: 'Terkirim' }];
+  const nextStage = (current) => {
+    const idx = STAGES.findIndex((s) => s.id === current);
+    return idx >= 0 && idx < STAGES.length - 1 ? STAGES[idx + 1].id : null;
+  };
+
+  const handle = async (order) => {
+    const next = nextStage(order.deliveryStatus || 'disiapkan');
+    if (!next) return;
+    setBusyId(order.id);
+    try {
+      await onAdvance(order, next);
+    } catch (e) {
+      console.error(e);
+      alert('Gagal update status, coba lagi.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <Card className="border-2" style={{ borderColor: COLORS.secondary }}>
+      <SectionLabel>🚚 Pesanan Aktif — Status Pengiriman ({orders.length})</SectionLabel>
+      <div className="space-y-2.5">
+        {orders.map((o) => {
+          const stage = o.deliveryStatus || 'disiapkan';
+          const stageIdx = STAGES.findIndex((s) => s.id === stage);
+          const busy = busyId === o.id;
+          const next = nextStage(stage);
+          return (
+            <div key={o.id} className="rounded-xl px-3 py-2.5" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{o.customerName || 'Tanpa nama'}</p>
+                <span className="text-sm font-display font-semibold shrink-0" style={{ color: COLORS.text }}>{rupiah(o.total)}</span>
+              </div>
+              <div className="flex items-center gap-1.5 mb-2.5">
+                {STAGES.map((s, i) => (
+                  <React.Fragment key={s.id}>
+                    <span className="text-[10px] px-2 py-1 rounded-full" style={{ background: i <= stageIdx ? COLORS.secondary : COLORS.surfaceLight, color: i <= stageIdx ? COLORS.bg : COLORS.textMuted }}>{s.label}</span>
+                    {i < STAGES.length - 1 && <span className="flex-1 h-0.5" style={{ background: i < stageIdx ? COLORS.secondary : COLORS.surfaceLight }} />}
+                  </React.Fragment>
+                ))}
+              </div>
+              {next && (
+                <button disabled={busy} onClick={() => handle(o)} className="w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+                  {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Truck className="w-3.5 h-3.5" />} Tandai "{STAGES.find((s) => s.id === next).label}"
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function PenjualanTab({ rawMaterials, baseStock, finishedStock, salesRecords, channels, onSaveSales, onSaveFinished, onSaveRaw, onSaveBase, onSaveChannels, pendingOrders, onConfirmOrder, onRejectOrder, activeDeliveries, onAdvanceDelivery, affiliates, affiliateSales, onSaveAffiliateSales }) {
+  const [date, setDate] = useState(todayISO());
+  const [channel, setChannel] = useState('');
+  const [showNewChannel, setShowNewChannel] = useState(false);
+  const [newChannelName, setNewChannelName] = useState('');
+  const [showManageChannels, setShowManageChannels] = useState(false);
+  const [items, setItems] = useState([{ id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
+  const [notes, setNotes] = useState('');
+
+  const isAffiliateEligible = (name) => BUSINESS_CONFIG.affiliateEligibleKeywords.some((kw) => (name || '').toLowerCase().includes(kw.toLowerCase()));
+
+  useEffect(() => {
+    if (!channel && channels.length > 0) setChannel(channels[0].name);
+  }, [channels, channel]);
+
+  useEffect(() => {
+    if (!channel) return;
+    const existing = salesRecords.find((r) => r.date === date && r.channel === channel);
+    if (existing) {
+      setItems(existing.items.map((i) => ({ id: genId(), name: i.name, qty: String(i.qty), price: String(i.price), affiliateId: i.affiliateId || '' })));
+      setNotes(existing.notes || '');
+    } else {
+      setItems([{ id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
+      setNotes('');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, channel]);
+
+  const addChannel = () => {
+    if (!newChannelName.trim()) return;
+    const name = newChannelName.trim();
+    onSaveChannels([...channels, { id: genId(), name }]);
+    setChannel(name);
+    setNewChannelName('');
+    setShowNewChannel(false);
+  };
+  const removeChannel = (id) => onSaveChannels(channels.filter((c) => c.id !== id));
+
+  const findMenu = (name) => finishedStock.find((f) => f.name.trim().toLowerCase() === name.trim().toLowerCase());
+
+  const updateItem = (id, field, value) => {
+    setItems(items.map((i) => {
+      if (i.id !== id) return i;
+      const next = { ...i, [field]: value };
+      if (field === 'name' && i.price === '') {
+        const match = findMenu(value);
+        if (match && match.sellingPrice) next.price = String(match.sellingPrice);
+      }
+      return next;
+    }));
+  };
+  const addRow = () => setItems([...items, { id: genId(), name: '', qty: '', price: '', affiliateId: '' }]);
+  const removeRow = (id) => setItems(items.filter((i) => i.id !== id));
+
+  const total = items.reduce((s, i) => s + (parseFloat(i.qty) || 0) * (parseFloat(i.price) || 0), 0);
+  const estHpp = items.reduce((s, i) => {
+    const match = findMenu(i.name || '');
+    const hpp = match ? menuHpp(match, rawMaterials, baseStock) : 0;
+    return s + (parseFloat(i.qty) || 0) * hpp;
+  }, 0);
+
+  const save = () => {
+    if (!channel) return;
+    const cleanItems = items
+      .filter((i) => i.name.trim() && parseFloat(i.qty) > 0)
+      .map((i) => {
+        const match = findMenu(i.name);
+        const hpp = match ? menuHpp(match, rawMaterials, baseStock) : 0;
+        return { name: i.name.trim(), qty: parseFloat(i.qty) || 0, price: parseFloat(i.price) || 0, hpp, affiliateId: isAffiliateEligible(i.name) ? (i.affiliateId || '') : '' };
+      });
+    if (cleanItems.length === 0) return;
+
+    const prevRecord = salesRecords.find((r) => r.date === date && r.channel === channel);
+    const totalRevenue = cleanItems.reduce((s, i) => s + i.qty * i.price, 0);
+    const totalHpp = cleanItems.reduce((s, i) => s + i.qty * i.hpp, 0);
+    const record = { id: prevRecord ? prevRecord.id : genId(), date, channel, items: cleanItems, total: totalRevenue, hpp: totalHpp, margin: totalRevenue - totalHpp, notes: notes.trim(), updatedAt: new Date().toISOString() };
+    const nextRecords = prevRecord ? salesRecords.map((r) => (r.id === prevRecord.id ? record : r)) : [...salesRecords, record];
+    onSaveSales(nextRecords);
+
+    // Sinkronkan komisi afiliator yang tertaut ke transaksi ini: hapus dulu yang lama
+    // (kalau ini edit ulang), lalu buat ulang dari item yang sekarang punya referensi afiliator.
+    const withoutOld = affiliateSales.filter((e) => e.autoFromSaleId !== record.id);
+    const newAffEntries = cleanItems
+      .filter((i) => i.affiliateId)
+      .map((i) => ({ id: genId(), affiliateId: i.affiliateId, date, boxQty: i.qty, combined: false, commission: computeAffiliateCommission(i.qty, false), autoFromSaleId: record.id }));
+    if (withoutOld.length !== affiliateSales.length || newAffEntries.length > 0) {
+      onSaveAffiliateSales([...withoutOld, ...newAffEntries]);
+    }
+
+    const prevQty = {};
+    (prevRecord ? prevRecord.items : []).forEach((i) => { const key = i.name.trim().toLowerCase(); prevQty[key] = (prevQty[key] || 0) + i.qty; });
+    const newQty = {};
+    cleanItems.forEach((i) => { const key = i.name.toLowerCase(); newQty[key] = (newQty[key] || 0) + i.qty; });
+    const names = new Set([...Object.keys(prevQty), ...Object.keys(newQty)]);
+
+    let nextFinished = finishedStock;
+    const rawDeltaMap = {};
+    const baseDeltaMap = {};
+
+    names.forEach((key) => {
+      const delta = (newQty[key] || 0) - (prevQty[key] || 0);
+      if (delta === 0) return;
+      const match = finishedStock.find((f) => f.name.trim().toLowerCase() === key);
+      if (!match) return;
+      if (match.recipeBased) {
+        (match.recipe || []).forEach((ing) => {
+          const type = ingSourceType(ing);
+          const id = ingSourceId(ing);
+          if (type === 'base') baseDeltaMap[id] = (baseDeltaMap[id] || 0) + ing.qty * delta;
+          else rawDeltaMap[id] = (rawDeltaMap[id] || 0) + ing.qty * delta;
+        });
+      } else {
+        nextFinished = nextFinished.map((f) => (f.id === match.id ? { ...f, currentStock: Math.max(0, f.currentStock - delta) } : f));
+      }
+    });
+
+    if (nextFinished !== finishedStock) onSaveFinished(nextFinished);
+    if (Object.keys(rawDeltaMap).length > 0) {
+      onSaveRaw(rawMaterials.map((rm) => (rawDeltaMap[rm.id] ? { ...rm, currentStock: Math.max(0, rm.currentStock - rawDeltaMap[rm.id]) } : rm)));
+    }
+    if (Object.keys(baseDeltaMap).length > 0) {
+      onSaveBase(baseStock.map((b) => (baseDeltaMap[b.id] ? { ...b, currentStock: Math.max(0, b.currentStock - baseDeltaMap[b.id]) } : b)));
+    }
+  };
+
+  const existingForDate = salesRecords.find((r) => r.date === date && r.channel === channel);
+
+  return (
+    <div className="space-y-4">
+      <IncomingOrdersPanel orders={pendingOrders} onConfirm={onConfirmOrder} onReject={onRejectOrder} />
+      <DeliveryTrackingPanel orders={activeDeliveries} onAdvance={onAdvanceDelivery} />
+      <Card>
+        <SectionLabel>Channel Penjualan</SectionLabel>
+        {channels.length === 0 && !showNewChannel && (
+          <div className="space-y-2">
+            <p className="text-xs" style={{ color: COLORS.warning }}>Belum ada channel — tambahkan dulu.</p>
+            <button onClick={() => setShowNewChannel(true)} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+              <Plus className="w-4 h-4" /> Tambah Channel
+            </button>
+          </div>
+        )}
+        {channels.length > 0 && !showNewChannel && (
+          <select value={channel} onChange={(e) => (e.target.value === '__new__' ? setShowNewChannel(true) : setChannel(e.target.value))} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text }}>
+            {channels.map((c) => <option key={c.id} value={c.name} style={{ background: COLORS.surface }}>{c.name}</option>)}
+            <option value="__new__" style={{ background: COLORS.surface }}>+ Tambah channel baru...</option>
+          </select>
+        )}
+        {showNewChannel && (
+          <div className="flex items-center gap-2">
+            <input value={newChannelName} onChange={(e) => setNewChannelName(e.target.value)} placeholder="Nama channel (mis. Outlet HO)" className="flex-1 rounded-lg px-3 py-2 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+            <button onClick={addChannel} className="px-3 py-2 rounded-lg text-sm font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Tambah</button>
+            {channels.length > 0 && <button onClick={() => setShowNewChannel(false)} style={{ color: COLORS.textMuted }}><X className="w-4 h-4" /></button>}
+          </div>
+        )}
+        {channels.length > 0 && (
+          <button onClick={() => setShowManageChannels(!showManageChannels)} className="text-[11px] mt-2" style={{ color: COLORS.textMuted }}>{showManageChannels ? 'Tutup' : 'Kelola channel'}</button>
+        )}
+        {showManageChannels && (
+          <div className="mt-2 space-y-1.5 pt-2 border-t" style={{ borderColor: COLORS.border }}>
+            {channels.map((c) => (
+              <div key={c.id} className="flex items-center justify-between text-xs">
+                <span style={{ color: COLORS.text }}>{c.name}</span>
+                <button onClick={() => removeChannel(c.id)} style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <SectionLabel>Tanggal</SectionLabel>
+        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text, colorScheme: 'dark' }} />
+        {existingForDate && <p className="text-[11px] mt-1.5" style={{ color: COLORS.warning }}>Tanggal + channel ini sudah ada catatan — akan ditimpa (edit) saat disimpan.</p>}
+      </Card>
+
+      <div>
+        <SectionLabel>Item Terjual</SectionLabel>
+        <div className="space-y-2">
+          {items.map((item) => {
+            const subtotal = (parseFloat(item.qty) || 0) * (parseFloat(item.price) || 0);
+            const match = findMenu(item.name || '');
+            return (
+              <div key={item.id} className="rounded-xl p-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                <div className="flex items-center gap-2 mb-2">
+                  <input value={item.name} onChange={(e) => updateItem(item.id, 'name', e.target.value)} list="menu-jadi-names" placeholder="Nama item yang terjual" className="flex-1 bg-transparent outline-none text-sm min-w-0" style={{ color: COLORS.text }} />
+                  <button onClick={() => removeRow(item.id)} style={{ color: COLORS.textMuted }}><X className="w-4 h-4" /></button>
+                </div>
+                <div className="grid grid-cols-3 gap-2 items-end">
+                  <Field label="Qty"><input type="number" value={item.qty} onChange={(e) => updateItem(item.id, 'qty', e.target.value)} className="w-full bg-transparent outline-none text-sm py-1.5" style={{ color: COLORS.text }} /></Field>
+                  <Field label="Harga satuan"><input type="number" value={item.price} onChange={(e) => updateItem(item.id, 'price', e.target.value)} className="w-full bg-transparent outline-none text-sm py-1.5" style={{ color: COLORS.text }} /></Field>
+                  <div className="text-right pb-1.5"><p className="text-[10px]" style={{ color: COLORS.textMuted }}>Subtotal</p><p className="text-sm font-semibold font-display" style={{ color: COLORS.secondary }}>{rupiah(subtotal)}</p></div>
+                </div>
+                {!match && item.name.trim() && <p className="text-[10px] mt-1.5" style={{ color: COLORS.warning }}>Tidak cocok dengan menu manapun — HPP dianggap Rp0.</p>}
+                {isAffiliateEligible(item.name) && (
+                  <div className="mt-2 pt-2 border-t" style={{ borderColor: COLORS.border }}>
+                    <Field label="Referensi Afiliator (opsional)">
+                      <select value={item.affiliateId} onChange={(e) => updateItem(item.id, 'affiliateId', e.target.value)} className="w-full bg-transparent outline-none text-sm py-1.5" style={{ color: COLORS.text }}>
+                        <option value="" style={{ background: COLORS.surface }}>Tidak ada</option>
+                        {affiliates.map((a) => <option key={a.id} value={a.id} style={{ background: COLORS.surface }}>{a.name}</option>)}
+                      </select>
+                    </Field>
+                    {item.affiliateId && <p className="text-[10px] mt-1" style={{ color: COLORS.secondary }}>Komisi {rupiah(BUSINESS_CONFIG.affiliateBaseCommission * (parseFloat(item.qty) || 0))} otomatis tercatat ke afiliator ini saat disimpan.</p>}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <datalist id="menu-jadi-names">{finishedStock.map((f) => <option key={f.id} value={f.name} />)}</datalist>
+        <button onClick={addRow} className="w-full mt-2 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}><Plus className="w-4 h-4" /> Tambah Item</button>
+      </div>
+
+      <Card>
+        <SectionLabel>Catatan (opsional)</SectionLabel>
+        <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Contoh: hujan deras, order sepi" className="w-full bg-transparent outline-none text-sm py-1" style={{ color: COLORS.text }} />
+      </Card>
+
+      <div className="rounded-2xl px-4 py-3.5 space-y-1.5" style={{ background: COLORS.primary }}>
+        <div className="flex items-center justify-between"><span className="text-sm font-medium" style={{ color: COLORS.text }}>Total Omzet</span><span className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(total)}</span></div>
+        <div className="flex items-center justify-between text-xs" style={{ color: 'rgba(242,233,220,0.85)' }}><span>Estimasi HPP: {rupiah(estHpp)}</span><span>Estimasi Laba: {rupiah(total - estHpp)}</span></div>
+      </div>
+
+      <button onClick={save} disabled={!channel} className="w-full py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}><Save className="w-4 h-4" /> Simpan Rekap Hari Ini</button>
+    </div>
+  );
+}
+
+/* ---------------- RIWAYAT TAB ---------------- */
+function RiwayatTab({ salesRecords, onSaveSales, wasteLog, onSaveWasteLog, affiliateSales, onSaveAffiliateSales, purchaseLog, rawMaterials, finishedStock, onSaveRaw, onSaveFinished, onSavePurchaseLog, onResetAll }) {
+  const [sub, setSub] = useState('penjualan');
+  const [expanded, setExpanded] = useState(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const sorted = [...salesRecords].sort((a, b) => (a.date === b.date ? (a.channel || '').localeCompare(b.channel || '') : a.date < b.date ? 1 : -1));
+  const kerugianOnly = wasteLog.filter((w) => !(w.reason || '').startsWith('retur'));
+  const wasteSorted = [...kerugianOnly].sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  const remove = (id) => {
+    onSaveSales(salesRecords.filter((r) => r.id !== id));
+    onSaveAffiliateSales(affiliateSales.filter((e) => e.autoFromSaleId !== id));
+    if (expanded === id) setExpanded(null);
+  };
+  const removeWaste = (id) => onSaveWasteLog(wasteLog.filter((w) => w.id !== id));
+
+  const exportSales = () => {
+    const rows = [['Tanggal', 'Channel', 'Item', 'Qty', 'Harga Satuan', 'Subtotal', 'HPP Satuan', 'Catatan']];
+    sorted.forEach((r) => {
+      r.items.forEach((i) => rows.push([r.date, r.channel || '', i.name, i.qty, i.price, i.qty * i.price, i.hpp || 0, r.notes || '']));
+    });
+    downloadCSV(`rekap-penjualan-${todayISO()}.csv`, rows);
+  };
+  const exportWaste = () => {
+    const rows = [['Tanggal', 'Sumber', 'Nama Item', 'Qty', 'Satuan', 'Alasan', 'Estimasi Biaya', 'Catatan']];
+    wasteSorted.forEach((w) => rows.push([w.date, w.sourceType, w.sourceName, w.qty, w.unit, WASTE_REASONS[w.reason] || w.reason, w.cost, w.notes || '']));
+    downloadCSV(`kerugian-${todayISO()}.csv`, rows);
+  };
+
+  const monthPrefix = todayISO().slice(0, 7);
+  const wasteThisMonth = kerugianOnly.filter((w) => w.date.startsWith(monthPrefix)).reduce((s, w) => s + w.cost, 0);
+
+  const SUB = [{ id: 'penjualan', label: 'Penjualan' }, { id: 'belanja', label: 'Belanja' }, { id: 'kerugian', label: 'Kerugian' }];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {SUB.map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-xs font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {sub === 'penjualan' && (
+        <>
+          <button onClick={exportSales} disabled={sorted.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
+            <Download className="w-4 h-4" /> Export ke Excel/CSV
+          </button>
+          {sorted.length === 0 ? (
+            <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada riwayat penjualan.</p></Card>
+          ) : (
+            <div className="space-y-2">
+              {sorted.map((r) => {
+                const isOpen = expanded === r.id;
+                const margin = getMargin(r);
+                return (
+                  <div key={r.id} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                    <button onClick={() => setExpanded(isOpen ? null : r.id)} className="w-full flex items-center justify-between px-3.5 py-3">
+                      <div className="text-left"><p className="text-sm font-medium" style={{ color: COLORS.text }}>{fmtDate(r.date)}</p><p className="text-[11px]" style={{ color: COLORS.textMuted }}>{r.channel ? `${r.channel} · ` : ''}{r.items.length} jenis item</p></div>
+                      <div className="text-right"><p className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(r.total)}</p><p className="text-[11px]" style={{ color: COLORS.secondary }}>Laba: {rupiah(margin)}</p></div>
+                    </button>
+                    {isOpen && (
+                      <div className="px-3.5 pb-3.5 border-t" style={{ borderColor: COLORS.border }}>
+                        <div className="mt-2.5 space-y-1.5">
+                          {r.items.map((i, idx) => (
+                            <div key={idx} className="flex items-center justify-between text-sm">
+                              <span style={{ color: COLORS.text }}>{i.name} <span style={{ color: COLORS.textMuted }}>×{i.qty}</span></span>
+                              <span style={{ color: COLORS.textMuted }}>{rupiah(i.qty * i.price)}</span>
+                            </div>
+                          ))}
+                        </div>
+                        {r.notes && <p className="text-[11px] mt-2 italic" style={{ color: COLORS.textMuted }}>"{r.notes}"</p>}
+                        <button onClick={() => remove(r.id)} className="mt-3 flex items-center gap-1.5 text-xs" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /> Hapus catatan ini</button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      {sub === 'belanja' && (
+        <PurchaseHistoryView purchaseLog={purchaseLog} rawMaterials={rawMaterials} finishedStock={finishedStock} onSaveRaw={onSaveRaw} onSaveFinished={onSaveFinished} onSavePurchaseLog={onSavePurchaseLog} />
+      )}
+
+      {sub === 'kerugian' && (
+        <>
+          <Card>
+            <div className="flex items-center justify-between">
+              <span className="text-sm" style={{ color: COLORS.textMuted }}>Total kerugian bulan ini</span>
+              <span className="font-display text-lg font-semibold" style={{ color: COLORS.primaryLight }}>{rupiah(wasteThisMonth)}</span>
+            </div>
+          </Card>
+          <button onClick={exportWaste} disabled={wasteSorted.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
+            <Download className="w-4 h-4" /> Export ke Excel/CSV
+          </button>
+          {wasteSorted.length === 0 ? (
+            <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan kerugian.</p></Card>
+          ) : (
+            <div className="space-y-2">
+              {wasteSorted.map((w) => (
+                <div key={w.id} className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{w.sourceName}</p>
+                      <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(w.date)} · {w.qty} {w.unit} · {WASTE_REASONS[w.reason] || w.reason}</p>
+                      {w.notes && <p className="text-[11px] italic mt-0.5" style={{ color: COLORS.textMuted }}>"{w.notes}"</p>}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-sm font-semibold" style={{ color: w.cost > 0 ? COLORS.primaryLight : COLORS.secondary }}>{w.cost > 0 ? rupiah(w.cost) : '-'}</span>
+                      <button onClick={() => removeWaste(w.id)} style={{ color: COLORS.textMuted }}><Trash2 className="w-3.5 h-3.5" /></button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="pt-4 border-t" style={{ borderColor: COLORS.border }}>
+        {!confirmReset ? (
+          <button onClick={() => setConfirmReset(true)} className="text-xs" style={{ color: COLORS.textMuted }}>Hapus semua data (stok & riwayat)</button>
+        ) : (
+          <div className="rounded-xl p-3" style={{ background: 'rgba(193,57,31,0.1)', border: `1px solid ${COLORS.primary}66` }}>
+            <p className="text-xs mb-2" style={{ color: COLORS.text }}>Yakin hapus semua data stok dan riwayat penjualan? Tidak bisa dibatalkan.</p>
+            <div className="flex gap-2">
+              <button onClick={() => setConfirmReset(false)} className="flex-1 py-2 rounded-lg text-xs" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={() => { onResetAll(); setConfirmReset(false); }} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Ya, hapus semua</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- AFFILIATE TAB (Nama Afiliator + Rekap Komisi Mingguan) ---------------- */
+function AffiliateTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, affiliatePayments, onSaveAffiliatePayments }) {
+  const [affForm, setAffForm] = useState(null); // { editingId, name }
+  const [entry, setEntry] = useState({ affiliateId: '', date: todayISO(), boxQty: '', combined: false });
+  const [expandedWeek, setExpandedWeek] = useState(null);
+
+  const openNewAff = () => setAffForm({ editingId: null, name: '' });
+  const openEditAff = (a) => setAffForm({ editingId: a.id, name: a.name });
+  const submitAff = () => {
+    if (!affForm.name.trim()) return;
+    const payload = { id: affForm.editingId || genId(), name: affForm.name.trim() };
+    onSaveAffiliates(affForm.editingId ? affiliates.map((a) => (a.id === affForm.editingId ? payload : a)) : [...affiliates, payload]);
+    setAffForm(null);
+  };
+  const removeAff = (id) => onSaveAffiliates(affiliates.filter((a) => a.id !== id));
+
+  const previewCommission = computeAffiliateCommission(parseFloat(entry.boxQty) || 0, entry.combined);
+  const saveEntry = () => {
+    if (!entry.affiliateId || !(parseFloat(entry.boxQty) > 0)) return;
+    const boxQty = parseFloat(entry.boxQty) || 0;
+    const commission = computeAffiliateCommission(boxQty, entry.combined);
+    onSaveAffiliateSales([...affiliateSales, { id: genId(), affiliateId: entry.affiliateId, date: entry.date, boxQty, combined: entry.combined, commission }]);
+    setEntry({ affiliateId: entry.affiliateId, date: entry.date, boxQty: '', combined: false });
+  };
+  const removeEntry = (id) => onSaveAffiliateSales(affiliateSales.filter((e) => e.id !== id));
+
+  const currentWeekStart = weekStartISO(todayISO());
+  const weeks = {};
+  affiliateSales.forEach((e) => {
+    const ws = weekStartISO(e.date);
+    if (!weeks[ws]) weeks[ws] = [];
+    weeks[ws].push(e);
+  });
+  const weekKeys = Object.keys(weeks).sort((a, b) => (a < b ? 1 : -1));
+
+  const summarizeWeek = (entries) => {
+    const byAff = {};
+    entries.forEach((e) => {
+      const aff = affiliates.find((a) => a.id === e.affiliateId);
+      const name = aff ? aff.name : 'Afiliator dihapus';
+      if (!byAff[name]) byAff[name] = { boxQty: 0, commission: 0 };
+      byAff[name].boxQty += e.boxQty;
+      byAff[name].commission += e.commission;
+    });
+    return byAff;
+  };
+
+  const currentWeekEntries = weeks[currentWeekStart] || [];
+  const currentWeekSummary = summarizeWeek(currentWeekEntries);
+  const currentWeekTotal = Object.values(currentWeekSummary).reduce((s, v) => s + v.commission, 0);
+  const togglePaid = (ws) => onSaveAffiliatePayments(affiliatePayments.includes(ws) ? affiliatePayments.filter((w) => w !== ws) : [...affiliatePayments, ws]);
+
+  // Klasemen bulanan (reset otomatis tiap bulan, murni ranking)
+  const monthPrefix = todayISO().slice(0, 7);
+  const monthLabel = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+  const monthEntries = affiliateSales.filter((e) => e.date.startsWith(monthPrefix));
+  const bySumm = summarizeWeek(monthEntries);
+  const klasemen = Object.entries(bySumm).sort((a, b) => b[1].commission - a[1].commission);
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <SectionLabel>Klasemen Bulan Ini · {monthLabel}</SectionLabel>
+        <Card>
+          {klasemen.length === 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada penjualan afiliator bulan ini.</p>
+          ) : (
+            <div className="space-y-2.5">
+              {klasemen.map(([name, v], idx) => (
+                <div key={name} className="flex items-center gap-3">
+                  <span className="w-6 text-center font-display font-bold text-sm shrink-0" style={{ color: idx === 0 ? COLORS.warning : COLORS.textMuted }}>{idx === 0 ? <Trophy className="w-4 h-4 inline" /> : `#${idx + 1}`}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{name}</p>
+                    <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{v.boxQty} box terjual</p>
+                  </div>
+                  <span className="font-display font-semibold text-sm shrink-0" style={{ color: COLORS.secondary }}>{rupiah(v.commission)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="text-[10px] mt-2.5 pt-2.5 border-t" style={{ color: COLORS.textMuted, borderColor: COLORS.border }}>Klasemen ranking, reset otomatis tiap bulan. Pembayaran komisi tetap mengikuti siklus mingguan di bawah.</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Minggu Ini · {weekRangeLabel(currentWeekStart)} (dibayar Minggu)</SectionLabel>
+        <Card>
+          {Object.keys(currentWeekSummary).length === 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada penjualan afiliator minggu ini.</p>
+          ) : (
+            <div className="space-y-2">
+              {Object.entries(currentWeekSummary).map(([name, v]) => (
+                <div key={name} className="flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><UserCheck className="w-3.5 h-3.5" style={{ color: COLORS.textMuted }} />{name} <span style={{ color: COLORS.textMuted }}>({v.boxQty} box)</span></span>
+                  <span className="font-display font-semibold" style={{ color: COLORS.secondary }}>{rupiah(v.commission)}</span>
+                </div>
+              ))}
+              <div className="flex items-center justify-between text-sm pt-2 border-t" style={{ borderColor: COLORS.border }}>
+                <span className="font-medium" style={{ color: COLORS.text }}>Total Komisi</span>
+                <span className="font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(currentWeekTotal)}</span>
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Input Penjualan Afiliator</SectionLabel>
+        <Card>
+          <div className="space-y-2.5">
+            <Field label="Afiliator">
+              <select value={entry.affiliateId} onChange={(e) => setEntry({ ...entry, affiliateId: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>Pilih afiliator</option>
+                {affiliates.map((a) => <option key={a.id} value={a.id} style={{ background: COLORS.surface }}>{a.name}</option>)}
+              </select>
+            </Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Tanggal"><input type="date" value={entry.date} onChange={(e) => setEntry({ ...entry, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} /></Field>
+              <Field label="Jumlah Box"><input type="number" value={entry.boxQty} onChange={(e) => setEntry({ ...entry, boxQty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            </div>
+            <button type="button" onClick={() => setEntry({ ...entry, combined: !entry.combined })} className="w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm" style={{ borderColor: COLORS.border, background: entry.combined ? 'rgba(122,154,87,0.12)' : COLORS.bg }}>
+              <span className="flex items-center gap-1.5" style={{ color: COLORS.text }}><Truck className="w-4 h-4" /> Dikirim sekaligus (+{rupiah(BUSINESS_CONFIG.affiliateCombinedBonus)}/box)</span>
+              <span className="w-9 h-5 rounded-full relative transition-colors" style={{ background: entry.combined ? COLORS.secondary : COLORS.border }}>
+                <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: entry.combined ? '18px' : '2px' }} />
+              </span>
+            </button>
+            <div className="rounded-lg px-3 py-2 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+              <span style={{ color: COLORS.textMuted }}>{rupiah(BUSINESS_CONFIG.affiliateBaseCommission + (entry.combined ? BUSINESS_CONFIG.affiliateCombinedBonus : 0))}/box</span>
+              <span style={{ color: COLORS.secondary }}>Komisi: {rupiah(previewCommission)}</span>
+            </div>
+          </div>
+          <button onClick={saveEntry} disabled={!entry.affiliateId || !(parseFloat(entry.boxQty) > 0)} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+            <Save className="w-4 h-4" /> Catat Penjualan
+          </button>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Daftar Afiliator</SectionLabel>
+        {affiliates.length === 0 && !affForm && <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada afiliator tercatat.</p></Card>}
+        <div className="space-y-2">
+          {affiliates.map((a) => (
+            <div key={a.id} className="flex items-center justify-between rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <p className="text-sm font-medium" style={{ color: COLORS.text }}>{a.name}</p>
+              <div className="flex items-center gap-1 shrink-0">
+                <button onClick={() => openEditAff(a)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                <button onClick={() => removeAff(a.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+        {!affForm && (
+          <button onClick={openNewAff} className="w-full mt-2 py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}><Plus className="w-4 h-4" /> Tambah Afiliator</button>
+        )}
+        {affForm && (
+          <Card className="mt-2">
+            <SectionLabel>{affForm.editingId ? 'Edit Afiliator' : 'Afiliator Baru'}</SectionLabel>
+            <Field label="Nama"><input value={affForm.name} onChange={(e) => setAffForm({ ...affForm, name: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            <div className="flex gap-2 mt-3.5">
+              <button onClick={() => setAffForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={submitAff} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+            </div>
+          </Card>
+        )}
+      </div>
+
+      <div>
+        <SectionLabel>Riwayat Mingguan</SectionLabel>
+        {weekKeys.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada riwayat.</p></Card>
+        ) : (
+          <div className="space-y-2">
+            {weekKeys.map((ws) => {
+              const isOpen = expandedWeek === ws;
+              const summary = summarizeWeek(weeks[ws]);
+              const total = Object.values(summary).reduce((s, v) => s + v.commission, 0);
+              const isPaid = affiliatePayments.includes(ws);
+              return (
+                <div key={ws} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${isPaid ? COLORS.border : COLORS.warning + '66'}` }}>
+                  <button onClick={() => setExpandedWeek(isOpen ? null : ws)} className="w-full flex items-center justify-between px-3.5 py-3">
+                    <span className="text-sm font-medium flex items-center gap-1.5" style={{ color: COLORS.text }}>
+                      {weekRangeLabel(ws)}{ws === currentWeekStart ? ' (minggu ini)' : ''}
+                      {isPaid && <BadgeCheck className="w-3.5 h-3.5" style={{ color: COLORS.secondary }} />}
+                    </span>
+                    <span className="font-display text-sm font-semibold" style={{ color: COLORS.secondary }}>{rupiah(total)}</span>
+                  </button>
+                  {isOpen && (
+                    <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                      {Object.entries(summary).map(([name, v]) => (
+                        <div key={name} className="flex items-center justify-between text-sm mt-2">
+                          <span style={{ color: COLORS.text }}>{name} <span style={{ color: COLORS.textMuted }}>×{v.boxQty} box</span></span>
+                          <span style={{ color: COLORS.textMuted }}>{rupiah(v.commission)}</span>
+                        </div>
+                      ))}
+                      <div className="pt-2 space-y-1">
+                        {weeks[ws].map((e) => {
+                          const aff = affiliates.find((a) => a.id === e.affiliateId);
+                          return (
+                            <div key={e.id} className="flex items-center justify-between text-[11px]" style={{ color: COLORS.textMuted }}>
+                              <span>{fmtDate(e.date)} · {aff ? aff.name : '-'} · {e.boxQty} box{e.combined ? ' · gabung kirim' : ''}{e.autoFromSaleId ? ' · dari Penjualan' : ''}</span>
+                              <button onClick={() => removeEntry(e.id)}><Trash2 className="w-3 h-3" /></button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <button onClick={() => togglePaid(ws)} className="w-full mt-2 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: isPaid ? COLORS.surfaceLight : COLORS.secondary, color: isPaid ? COLORS.textMuted : COLORS.bg }}>
+                        <BadgeCheck className="w-3.5 h-3.5" /> {isPaid ? 'Sudah Dibayar (batalkan)' : 'Tandai Sudah Dibayar'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- PURCHASE TAB (Belanja Bahan Baku + Menu Jadi non-resep) ---------------- */
+function PurchaseEntryTab({ rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
+  const [entry, setEntry] = useState({ sourceType: 'raw', itemId: '', date: todayISO(), qty: '', price: '', notes: '' });
+
+  const buyableMenu = finishedStock.filter((f) => !f.recipeBased);
+  const sourceList = entry.sourceType === 'raw' ? rawMaterials : buyableMenu;
+  const saveSourceStock = entry.sourceType === 'raw' ? onSaveRaw : onSaveFinished;
+  const sourceListFor = (type) => (type === 'raw' ? rawMaterials : buyableMenu);
+
+  const updatePurchasePriceIfLatest = (sourceType, itemId, allEntries) => {
+    const entriesForItem = allEntries.filter((e) => e.sourceType === sourceType && e.itemId === itemId);
+    if (entriesForItem.length === 0) return;
+    const latest = entriesForItem.reduce((a, b) => (a.date >= b.date ? a : b));
+    const list = sourceListFor(sourceType);
+    const save = sourceType === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, purchasePrice: latest.price } : it)));
+  };
+
+  const selectedItem = sourceList.find((r) => r.id === entry.itemId);
+  const previewTotal = (parseFloat(entry.qty) || 0) * (parseFloat(entry.price) || 0);
+
+  const switchSource = (type) => setEntry({ ...entry, sourceType: type, itemId: '', price: '' });
+
+  const onSelectItem = (id) => {
+    const item = sourceList.find((r) => r.id === id);
+    setEntry({ ...entry, itemId: id, price: item ? String(item.purchasePrice || '') : '' });
+  };
+
+  const submit = () => {
+    const qty = parseFloat(entry.qty) || 0;
+    const price = parseFloat(entry.price) || 0;
+    if (!selectedItem || qty <= 0 || price <= 0) return;
+    const newEntry = { id: genId(), date: entry.date, sourceType: entry.sourceType, itemId: selectedItem.id, itemName: selectedItem.name, qty, unit: selectedItem.unit, price, totalCost: qty * price, notes: entry.notes.trim() };
+    const nextLog = [...purchaseLog, newEntry];
+    onSavePurchaseLog(nextLog);
+    saveSourceStock(sourceList.map((it) => (it.id === selectedItem.id ? { ...it, currentStock: it.currentStock + qty } : it)));
+    updatePurchasePriceIfLatest(entry.sourceType, selectedItem.id, nextLog);
+    setEntry({ sourceType: entry.sourceType, itemId: '', date: entry.date, qty: '', price: '', notes: '' });
+  };
+
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+  const todayTotal = purchaseLog.filter((e) => e.date === today).reduce((s, e) => s + e.totalCost, 0);
+  const monthTotal = purchaseLog.filter((e) => e.date.startsWith(monthPrefix)).reduce((s, e) => s + e.totalCost, 0);
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Belanja hari ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(todayTotal)}</p>
+        </Card>
+        <Card>
+          <p className="text-[11px] mb-1" style={{ color: COLORS.textMuted }}>Belanja bulan ini</p>
+          <p className="font-display text-lg font-semibold" style={{ color: COLORS.text }}>{rupiah(monthTotal)}</p>
+          <p className="text-[10px] mt-0.5" style={{ color: COLORS.textMuted }}>Reset otomatis tiap tanggal 1</p>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Catat Belanja</SectionLabel>
+        <Card>
+          <div className="flex rounded-lg p-1 mb-2.5" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+            {[{ id: 'raw', label: 'Bahan Baku' }, { id: 'menu', label: 'Menu Jadi (Beli Jadi)' }].map((t) => (
+              <button key={t.id} onClick={() => switchSource(t.id)} className="flex-1 py-1.5 rounded-md text-xs font-medium" style={entry.sourceType === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div className="space-y-2.5">
+            <Field label={entry.sourceType === 'raw' ? 'Bahan Baku' : 'Menu Jadi'}>
+              <select value={entry.itemId} onChange={(e) => onSelectItem(e.target.value)} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }}>
+                <option value="" style={{ background: COLORS.surface }}>{entry.sourceType === 'raw' ? 'Pilih bahan baku' : 'Pilih menu jadi'}</option>
+                {sourceList.map((it) => <option key={it.id} value={it.id} style={{ background: COLORS.surface }}>{it.name} ({it.unit})</option>)}
+              </select>
+              {entry.sourceType === 'menu' && sourceList.length === 0 && (
+                <p className="text-[10px] pb-1.5" style={{ color: COLORS.warning }}>Belum ada Menu Jadi yang bukan resep (semua masih "Pakai Resep").</p>
+              )}
+            </Field>
+            <Field label="Tanggal (bisa tanggal yang sudah lewat)">
+              <input type="date" value={entry.date} max={todayISO()} onChange={(e) => setEntry({ ...entry, date: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} />
+            </Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label={`Qty${selectedItem ? ` (${selectedItem.unit})` : ''}`}>
+                <input type="number" value={entry.qty} onChange={(e) => setEntry({ ...entry, qty: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+              <Field label="Harga per Satuan">
+                <input type="number" value={entry.price} onChange={(e) => setEntry({ ...entry, price: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+              </Field>
+            </div>
+            <Field label="Catatan (opsional)">
+              <input value={entry.notes} onChange={(e) => setEntry({ ...entry, notes: e.target.value })} placeholder="Contoh: beli di Pasar Kliwon" className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} />
+            </Field>
+          </div>
+          <div className="rounded-lg px-3 py-2 mt-2.5 text-xs flex items-center justify-between" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+            <span style={{ color: COLORS.textMuted }}>Total Belanja</span>
+            <span className="font-semibold font-display" style={{ color: COLORS.text }}>{rupiah(previewTotal)}</span>
+          </div>
+          <button onClick={submit} disabled={!selectedItem || !(parseFloat(entry.qty) > 0) || !(parseFloat(entry.price) > 0)} className="w-full mt-3 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-50" style={{ background: COLORS.secondary, color: COLORS.bg }}>
+            <Save className="w-4 h-4" /> Simpan Belanja
+          </button>
+          <p className="text-[10px] mt-2" style={{ color: COLORS.textMuted }}>Stok item terkait otomatis bertambah, dan harga beli default-nya ikut ter-update ke harga terbaru yang tercatat. Riwayat lengkapnya ada di tab Riwayat.</p>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- PURCHASE HISTORY (dipakai di dalam RiwayatTab) ---------------- */
+function PurchaseHistoryView({ purchaseLog, rawMaterials, finishedStock, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
+  const [expandedMonth, setExpandedMonth] = useState(null);
+  const today = todayISO();
+  const monthPrefix = today.slice(0, 7);
+
+  const sourceListFor = (type) => (type === 'raw' ? rawMaterials : finishedStock);
+  const updatePurchasePriceIfLatest = (sourceType, itemId, allEntries) => {
+    const entriesForItem = allEntries.filter((e) => e.sourceType === sourceType && e.itemId === itemId);
+    if (entriesForItem.length === 0) return;
+    const latest = entriesForItem.reduce((a, b) => (a.date >= b.date ? a : b));
+    const list = sourceListFor(sourceType);
+    const save = sourceType === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, purchasePrice: latest.price } : it)));
+  };
+
+  const removeEntry = (id) => {
+    const target = purchaseLog.find((e) => e.id === id);
+    if (!target) return;
+    const type = target.sourceType || 'raw';
+    const itemId = target.itemId || target.rawMaterialId;
+    const list = sourceListFor(type);
+    const save = type === 'raw' ? onSaveRaw : onSaveFinished;
+    save(list.map((it) => (it.id === itemId ? { ...it, currentStock: Math.max(0, it.currentStock - target.qty) } : it)));
+    const nextLog = purchaseLog.filter((e) => e.id !== id);
+    onSavePurchaseLog(nextLog);
+    updatePurchasePriceIfLatest(type, itemId, nextLog);
+  };
+
+  const exportPurchases = () => {
+    const rows = [['Tanggal', 'Sumber', 'Nama Item', 'Qty', 'Satuan', 'Harga', 'Total', 'Catatan']];
+    [...purchaseLog].sort((a, b) => (a.date < b.date ? 1 : -1)).forEach((e) => rows.push([e.date, (e.sourceType || 'raw') === 'raw' ? 'Bahan Baku' : 'Menu Jadi', e.itemName || e.rawMaterialName, e.qty, e.unit, e.price, e.totalCost, e.notes || '']));
+    downloadCSV(`belanja-${today}.csv`, rows);
+  };
+
+  const byMonth = {};
+  purchaseLog.forEach((e) => { const mp = e.date.slice(0, 7); (byMonth[mp] = byMonth[mp] || []).push(e); });
+  const monthKeys = Object.keys(byMonth).sort((a, b) => (a < b ? 1 : -1));
+  const monthLabelOf = (mp) => new Date(mp + '-01T00:00:00').toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+
+  return (
+    <div className="space-y-4">
+      <button onClick={exportPurchases} disabled={purchaseLog.length === 0} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 disabled:opacity-40" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px solid ${COLORS.border}` }}>
+        <Download className="w-4 h-4" /> Export ke Excel/CSV
+      </button>
+      {monthKeys.length === 0 ? (
+        <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada catatan belanja.</p></Card>
+      ) : (
+        <div className="space-y-2">
+          {monthKeys.map((mp) => {
+            const isOpen = expandedMonth === mp;
+            const entries = [...byMonth[mp]].sort((a, b) => (a.date < b.date ? 1 : -1));
+            const total = entries.reduce((s, e) => s + e.totalCost, 0);
+            return (
+              <div key={mp} className="rounded-xl overflow-hidden" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+                <button onClick={() => setExpandedMonth(isOpen ? null : mp)} className="w-full flex items-center justify-between px-3.5 py-3">
+                  <span className="text-sm font-medium" style={{ color: COLORS.text }}>{monthLabelOf(mp)}{mp === monthPrefix ? ' (bulan ini)' : ''}</span>
+                  <span className="font-display text-sm font-semibold" style={{ color: COLORS.text }}>{rupiah(total)}</span>
+                </button>
+                {isOpen && (
+                  <div className="px-3.5 pb-3.5 border-t space-y-2" style={{ borderColor: COLORS.border }}>
+                    {entries.map((e) => (
+                      <div key={e.id} className="flex items-start justify-between text-sm mt-2">
+                        <div className="min-w-0">
+                          <p style={{ color: COLORS.text }}>
+                            {e.itemName || e.rawMaterialName}
+                            <span className="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>{(e.sourceType || 'raw') === 'raw' ? 'Bahan Baku' : 'Menu Jadi'}</span>
+                            <span style={{ color: COLORS.textMuted }}> · {e.qty} {e.unit} × {rupiah(e.price)}</span>
+                          </p>
+                          <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(e.date)}{e.notes ? ` · "${e.notes}"` : ''}</p>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-medium" style={{ color: COLORS.text }}>{rupiah(e.totalCost)}</span>
+                          <button onClick={() => removeEntry(e.id)} style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- PROMO TAB ---------------- */
+function PromoTab({ promos, onSavePromos }) {
+  const [form, setForm] = useState(null); // { editingId, name, startDate, endDate, description }
+
+  const openNew = () => setForm({ editingId: null, name: '', startDate: todayISO(), endDate: todayISO(), description: '' });
+  const openEdit = (p) => setForm({ editingId: p.id, name: p.name, startDate: p.startDate, endDate: p.endDate, description: p.description || '' });
+  const submit = () => {
+    if (!form.name.trim() || !form.startDate || !form.endDate) return;
+    const payload = { id: form.editingId || genId(), name: form.name.trim(), startDate: form.startDate, endDate: form.endDate, description: form.description.trim() };
+    onSavePromos(form.editingId ? promos.map((p) => (p.id === form.editingId ? payload : p)) : [...promos, payload]);
+    setForm(null);
+  };
+  const remove = (id) => onSavePromos(promos.filter((p) => p.id !== id));
+
+  const sorted = [...promos].sort((a, b) => (a.startDate < b.startDate ? 1 : -1));
+  const active = sorted.filter((p) => isPromoActive(p));
+  const upcoming = sorted.filter((p) => p.startDate > todayISO());
+  const past = sorted.filter((p) => p.endDate < todayISO());
+
+  const PromoCard = ({ p, status }) => (
+    <div className="rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${status === 'active' ? COLORS.secondary + '88' : COLORS.border}` }}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{p.name}</p>
+            {status === 'active' && <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: 'rgba(122,154,87,0.15)', color: COLORS.secondary }}>Berjalan</span>}
+            {status === 'upcoming' && <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: COLORS.surfaceLight, color: COLORS.warning }}>Akan Datang</span>}
+          </div>
+          <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{fmtDate(p.startDate)} – {fmtDate(p.endDate)}</p>
+          {p.description && <p className="text-[11px] mt-1" style={{ color: COLORS.textMuted }}>{p.description}</p>}
+        </div>
+        <div className="flex items-center gap-1 shrink-0">
+          <button onClick={() => openEdit(p)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+          <button onClick={() => remove(p.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <SectionLabel>Promo Berjalan Bulan Ini</SectionLabel>
+        {active.length === 0 ? (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Tidak ada promo yang sedang berjalan.</p></Card>
+        ) : (
+          <div className="space-y-2">{active.map((p) => <PromoCard key={p.id} p={p} status="active" />)}</div>
+        )}
+      </div>
+
+      {upcoming.length > 0 && (
+        <div>
+          <SectionLabel>Akan Datang</SectionLabel>
+          <div className="space-y-2">{upcoming.map((p) => <PromoCard key={p.id} p={p} status="upcoming" />)}</div>
+        </div>
+      )}
+
+      {!form && (
+        <button onClick={openNew} className="w-full py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+          <Plus className="w-4 h-4" /> Tambah Promo
+        </button>
+      )}
+      {form && (
+        <Card>
+          <SectionLabel>{form.editingId ? 'Edit Promo' : 'Promo Baru'}</SectionLabel>
+          <div className="space-y-2.5">
+            <Field label="Nama Promo"><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Contoh: Promo 17-an, Beli 2 Gratis 1" className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Mulai"><input type="date" value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} /></Field>
+              <Field label="Selesai"><input type="date" value={form.endDate} onChange={(e) => setForm({ ...form, endDate: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text, colorScheme: 'dark' }} /></Field>
+            </div>
+            <Field label="Keterangan (opsional)"><input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+          </div>
+          <div className="flex gap-2 mt-3.5">
+            <button onClick={() => setForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+            <button onClick={submit} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+          </div>
+        </Card>
+      )}
+
+      {past.length > 0 && (
+        <div>
+          <SectionLabel>Sudah Selesai</SectionLabel>
+          <div className="space-y-2">{past.map((p) => <PromoCard key={p.id} p={p} status="past" />)}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- MARKETING TAB (wrapper: Afiliator | Promo) ---------------- */
+function MarketingTab({ affiliates, affiliateSales, onSaveAffiliates, onSaveAffiliateSales, affiliatePayments, onSaveAffiliatePayments, promos, onSavePromos }) {
+  const [sub, setSub] = useState('afiliator');
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {[{ id: 'afiliator', label: 'Afiliator' }, { id: 'promo', label: 'Promo Berjalan' }].map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-sm font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {sub === 'afiliator' ? (
+        <AffiliateTab affiliates={affiliates} affiliateSales={affiliateSales} onSaveAffiliates={onSaveAffiliates} onSaveAffiliateSales={onSaveAffiliateSales} affiliatePayments={affiliatePayments} onSaveAffiliatePayments={onSaveAffiliatePayments} />
+      ) : (
+        <PromoTab promos={promos} onSavePromos={onSavePromos} />
+      )}
+    </div>
+  );
+}
+
+function KeuanganTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings, rawMaterials, finishedStock, purchaseLog, onSaveRaw, onSaveFinished, onSavePurchaseLog }) {
+  const [sub, setSub] = useState('gaji');
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl p-1" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+        {[{ id: 'gaji', label: 'Target Penjualan' }, { id: 'belanja', label: 'Belanja Bahan' }].map((t) => (
+          <button key={t.id} onClick={() => setSub(t.id)} className="flex-1 py-2 rounded-lg text-xs font-medium transition-colors" style={sub === t.id ? { background: COLORS.primary, color: COLORS.text } : { color: COLORS.textMuted }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {sub === 'gaji' && (
+        <TargetTab employees={employees} targetSettings={targetSettings} salesRecords={salesRecords} onSaveEmployees={onSaveEmployees} onSaveTargetSettings={onSaveTargetSettings} />
+      )}
+      {sub === 'belanja' && (
+        <PurchaseEntryTab rawMaterials={rawMaterials} finishedStock={finishedStock} purchaseLog={purchaseLog} onSaveRaw={onSaveRaw} onSaveFinished={onSaveFinished} onSavePurchaseLog={onSavePurchaseLog} />
+      )}
+    </div>
+  );
+}
+
+/* ---------------- TARGET TAB (Gaji Karyawan + Target Bulanan) ---------------- */
+function TargetTab({ employees, targetSettings, salesRecords, onSaveEmployees, onSaveTargetSettings }) {
+  const [empForm, setEmpForm] = useState(null); // { editingId, name, salary }
+  const [bufferInput, setBufferInput] = useState(String(targetSettings.bufferAmount || ''));
+
+  const t = computeTargetStats(employees, targetSettings.bufferAmount, salesRecords);
+  const monthLabel = formatTargetPeriodLabel(t);
+
+  const openNewEmp = () => setEmpForm({ editingId: null, name: '', salary: '' });
+  const openEditEmp = (e) => setEmpForm({ editingId: e.id, name: e.name, salary: String(e.salary) });
+  const submitEmp = () => {
+    if (!empForm.name.trim()) return;
+    const payload = { id: empForm.editingId || genId(), name: empForm.name.trim(), salary: parseFloat(empForm.salary) || 0 };
+    onSaveEmployees(empForm.editingId ? employees.map((e) => (e.id === empForm.editingId ? payload : e)) : [...employees, payload]);
+    setEmpForm(null);
+  };
+  const removeEmp = (id) => onSaveEmployees(employees.filter((e) => e.id !== id));
+  const saveBuffer = () => onSaveTargetSettings({ ...targetSettings, bufferAmount: parseFloat(bufferInput) || 0 });
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <SectionLabel>Progress Bulan Ini · {monthLabel}</SectionLabel>
+        <Card>
+          {t.targetBulanan <= 0 ? (
+            <p className="text-sm" style={{ color: COLORS.textMuted }}>Tambahkan karyawan dan/atau buffer di bawah untuk mulai memantau target.</p>
+          ) : (
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs" style={{ color: COLORS.textMuted }}>Target Bulanan</span>
+                <span className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.targetBulanan)}</span>
+              </div>
+              <div className="w-full h-2.5 rounded-full overflow-hidden" style={{ background: COLORS.surfaceLight }}>
+                <div className="h-full rounded-full" style={{ width: `${Math.min(100, t.progressPercent)}%`, background: COLORS.secondary }} />
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span style={{ color: COLORS.textMuted }}>Realisasi: {rupiah(t.realisasi)}</span>
+                <span className="font-semibold" style={{ color: COLORS.secondary }}>{t.progressPercent.toFixed(1)}%</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Target harian rata-rata</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.targetHarianRataRata)}</p>
+                </div>
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Sisa target</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.sisaTarget)}</p>
+                </div>
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Butuh/hari (sisa {t.sisaHari} hari)</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: COLORS.text }}>{rupiah(t.rataRataDibutuhkan)}</p>
+                </div>
+                <div className="rounded-lg px-3 py-2" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+                  <p className="text-[10px]" style={{ color: COLORS.textMuted }}>Status vs jalur harian</p>
+                  <p className="text-sm font-display font-semibold" style={{ color: t.paceDiff >= 0 ? COLORS.secondary : COLORS.warning }}>{t.paceDiff >= 0 ? `+${rupiah(t.paceDiff)}` : `−${rupiah(Math.abs(t.paceDiff))}`}</p>
+                </div>
+              </div>
+              <p className="text-[10px] pt-1" style={{ color: COLORS.textMuted }}>Target dihitung ulang tiap bulan kalender (gajian tanggal 1), dari daftar karyawan + buffer yang aktif saat ini.</p>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Buffer Biaya Operasional Lain</SectionLabel>
+        <Card>
+          <p className="text-[11px] mb-2" style={{ color: COLORS.textMuted }}>Perkiraan listrik, gas, sewa, dll di luar gaji — ditambahkan ke Target Bulanan supaya "tercapai" berarti benar-benar cukup, bukan cuma pas-pasan buat gaji.</p>
+          <div className="flex items-center gap-2">
+            <input type="number" value={bufferInput} onChange={(e) => setBufferInput(e.target.value)} placeholder="0" className="flex-1 rounded-lg px-3 py-2 text-sm border" style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.text }} />
+            <button onClick={saveBuffer} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ background: COLORS.primary, color: COLORS.text }}>Simpan</button>
+          </div>
+        </Card>
+      </div>
+
+      <div>
+        <SectionLabel>Daftar Karyawan · Total Gaji: {rupiah(t.totalGaji)}</SectionLabel>
+        {employees.length === 0 && !empForm && (
+          <Card><p className="text-sm" style={{ color: COLORS.textMuted }}>Belum ada karyawan tercatat.</p></Card>
+        )}
+        <div className="space-y-2">
+          {employees.map((e) => (
+            <div key={e.id} className="flex items-center justify-between rounded-xl px-3.5 py-3" style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }}>
+              <div className="min-w-0">
+                <p className="text-sm font-medium truncate" style={{ color: COLORS.text }}>{e.name}</p>
+                <p className="text-[11px]" style={{ color: COLORS.textMuted }}>{rupiah(e.salary)}/bulan</p>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button onClick={() => openEditEmp(e)} className="p-1.5 rounded-md" style={{ color: COLORS.textMuted }}><Pencil className="w-3.5 h-3.5" /></button>
+                <button onClick={() => removeEmp(e.id)} className="p-1.5 rounded-md" style={{ color: COLORS.primaryLight }}><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {!empForm && (
+          <button onClick={openNewEmp} className="w-full mt-2 py-3 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.surfaceLight, color: COLORS.text, border: `1px dashed ${COLORS.border}` }}>
+            <Plus className="w-4 h-4" /> Tambah Karyawan
+          </button>
+        )}
+
+        {empForm && (
+          <Card className="mt-2">
+            <SectionLabel>{empForm.editingId ? 'Edit Karyawan' : 'Karyawan Baru'}</SectionLabel>
+            <div className="space-y-2.5">
+              <Field label="Nama"><input value={empForm.name} onChange={(e) => setEmpForm({ ...empForm, name: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+              <Field label="Gaji per Bulan"><input type="number" value={empForm.salary} onChange={(e) => setEmpForm({ ...empForm, salary: e.target.value })} className="w-full bg-transparent outline-none text-sm py-2" style={{ color: COLORS.text }} /></Field>
+            </div>
+            <div className="flex gap-2 mt-3.5">
+              <button onClick={() => setEmpForm(null)} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ background: COLORS.surfaceLight, color: COLORS.textMuted }}>Batal</button>
+              <button onClick={submitEmp} className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: COLORS.primary, color: COLORS.text }}><Check className="w-4 h-4" /> Simpan</button>
+            </div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
